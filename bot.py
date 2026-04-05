@@ -17,8 +17,8 @@ BASE_URL = "https://api.coindcx.com"
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_FAST_PERIOD       = 50
 EMA_SLOW_PERIOD       = 100
-TP_PCT                = 0.01
-SL_PCT                = 0.10
+TP_PCT                = 0.005
+SL_PCT                = 0.075
 MIN_RR                = 0.05
 EMA50_SLOPE_BARS      = 5
 EMA100_SLOPE_BARS     = 5
