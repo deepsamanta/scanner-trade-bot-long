@@ -15,14 +15,14 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD       = 50
-EMA_SLOW_PERIOD       = 100
+EMA_FAST_PERIOD       = 21
+EMA_SLOW_PERIOD       = 50
 TP_PCT                = 0.015
 SL_PCT                = 0.075
 MIN_RR                = 0.05
+EMA21_SLOPE_BARS      = 5
 EMA50_SLOPE_BARS      = 5
-EMA100_SLOPE_BARS     = 5
-EMA100_FLAT_THRESHOLD = 0.001
+EMA50_FLAT_THRESHOLD  = 0.001
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
 REQUEST_TIMEOUT       = 15
@@ -298,7 +298,7 @@ def get_recent_high(symbol):
 
 def get_quantity_step(symbol):
     try:
-        pair = fut_pair(symbol) 
+        pair = fut_pair(symbol)
         url  = (
             "https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument"
             f"?pair={pair}&margin_currency_short_name=USDT"
@@ -453,12 +453,12 @@ def check_and_trade(symbol, row, df):
 
     del candles
 
-    ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
-    ema100_values = compute_ema(closes, EMA_SLOW_PERIOD)
+    ema21_values = compute_ema(closes, EMA_FAST_PERIOD)
+    ema50_values = compute_ema(closes, EMA_SLOW_PERIOD)
     del closes
 
-    ema50  = round(ema50_values[-1],  precision)
-    ema100 = round(ema100_values[-1], precision)
+    ema21 = round(ema21_values[-1], precision)
+    ema50 = round(ema50_values[-1], precision)
 
     # =========================================================================
     # GATE 1 — Open position check (order was filled → live position exists)
@@ -506,45 +506,45 @@ def check_and_trade(symbol, row, df):
 
     # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
 
-    # 50 EMA must have a POSITIVE slope (turning up = bullish momentum building)
-    ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
-    if ema50_slope <= 0:
-        print(f"[SKIP] {symbol} 50 EMA slope not up ({round(ema50_slope, precision)}) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
+    # 21 EMA must have a POSITIVE slope (turning up = bullish momentum building)
+    ema21_slope = ema21_values[-1] - ema21_values[-EMA21_SLOPE_BARS]
+    if ema21_slope <= 0:
+        print(f"[SKIP] {symbol} 21 EMA slope not up ({round(ema21_slope, precision)}) | 21 EMA {ema21} | 50 EMA {ema50} | Price {last_close}")
         return
 
-    # 100 EMA must be FLAT or POSITIVE (not still strongly falling)
-    ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
-    ema100_slope_pct = ema100_slope / last_close
-    if ema100_slope_pct < -EMA100_FLAT_THRESHOLD:
-        print(f"[SKIP] {symbol} 100 EMA still falling (slope {round(ema100_slope_pct * 100, 4)}%) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
+    # 50 EMA must be FLAT or POSITIVE (not still strongly falling)
+    ema50_slope     = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
+    ema50_slope_pct = ema50_slope / last_close
+    if ema50_slope_pct < -EMA50_FLAT_THRESHOLD:
+        print(f"[SKIP] {symbol} 50 EMA still falling (slope {round(ema50_slope_pct * 100, 4)}%) | 21 EMA {ema21} | 50 EMA {ema50} | Price {last_close}")
         return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
 
-    # Macro context: 50 EMA was below 100 EMA (bearish-to-bullish flip in play)
-    macro_bearish_context = ema50 < ema100
+    # Macro context: 21 EMA was below 50 EMA (bearish-to-bullish flip in play)
+    macro_bearish_context = ema21 < ema50
 
-    # Price has crossed ABOVE the 50 EMA from below (bullish EMA crossover signal)
+    # Price has crossed ABOVE the 21 EMA from below (bullish EMA crossover signal)
+    above_ema21 = last_close > ema21
+
+    # Price has also pushed ABOVE the 50 EMA (full breakout confirmed)
     above_ema50 = last_close > ema50
 
-    # Price has also pushed ABOVE the 100 EMA (full breakout confirmed)
-    above_ema100 = last_close > ema100
-
     if not macro_bearish_context:
-        print(f"[SKIP] {symbol} 50 EMA {ema50} is already above 100 EMA {ema100} — macro context not bearish-to-bullish | Price {last_close}")
+        print(f"[SKIP] {symbol} 21 EMA {ema21} is already above 50 EMA {ema50} — macro context not bearish-to-bullish | Price {last_close}")
+        return
+
+    if not above_ema21:
+        print(f"[SKIP] {symbol} price {last_close} has not crossed above 21 EMA {ema21} | 50 EMA {ema50}")
         return
 
     if not above_ema50:
-        print(f"[SKIP] {symbol} price {last_close} has not crossed above 50 EMA {ema50} | 100 EMA {ema100}")
-        return
-
-    if not above_ema100:
-        print(f"[SKIP] {symbol} price {last_close} has not cleared above 100 EMA {ema100} | 50 EMA {ema50}")
+        print(f"[SKIP] {symbol} price {last_close} has not cleared above 50 EMA {ema50} | 21 EMA {ema21}")
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} | 50 EMA {ema50} | 100 EMA {ema100} "
-        f"| 50 slope +{round(ema50_slope, precision)} | 100 slope {round(ema100_slope_pct * 100, 4)}% "
+        f"[SIGNAL] {symbol} | Price {last_close} | 21 EMA {ema21} | 50 EMA {ema50} "
+        f"| 21 slope +{round(ema21_slope, precision)} | 50 slope {round(ema50_slope_pct * 100, 4)}% "
         f"| TP {round(last_close * (1 + TP_PCT), precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
@@ -587,12 +587,12 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>50/100 Breakout Long</code>\n"
+    f"📐 Strategy : <code>21/50 Breakout Long</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📈 Entry    : <code>Price above 50 &amp; 100 EMA (50 EMA still below 100)</code>\n"
-    f"✅ Context  : <code>50 EMA below 100 EMA (bearish-to-bullish flip)</code>\n"
-    f"📉 50 EMA   : <code>Slope must be positive</code>\n"
-    f"📊 100 EMA  : <code>Slope must be flat or positive</code>\n"
+    f"📈 Entry    : <code>Price above 21 &amp; 50 EMA (21 EMA still below 50)</code>\n"
+    f"✅ Context  : <code>21 EMA below 50 EMA (bearish-to-bullish flip)</code>\n"
+    f"📉 21 EMA   : <code>Slope must be positive</code>\n"
+    f"📊 50 EMA   : <code>Slope must be flat or positive</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed above entry</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
