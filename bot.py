@@ -15,21 +15,17 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD       = 21
-EMA_SLOW_PERIOD       = 50
-TP_PCT                = 0.015
-SL_PCT                = 0.075
-MIN_RR                = 0.05
-EMA21_SLOPE_BARS      = 5
-EMA50_SLOPE_BARS      = 5
-EMA50_FLAT_THRESHOLD  = 0.001
+EMA_PERIOD       = 21
+TP_PCT           = 0.015
+SL_PCT           = 0.075
+MIN_RR           = 0.05
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
-REQUEST_TIMEOUT       = 15
-TELEGRAM_TIMEOUT      = 10
+REQUEST_TIMEOUT  = 15
+TELEGRAM_TIMEOUT = 10
 
 # ─── GSPREAD RE-AUTH INTERVAL ─────────────────────────────────────────────────
-GSHEET_REAUTH_INTERVAL = 45 * 60   # 45 minutes in seconds
+GSHEET_REAUTH_INTERVAL = 45 * 60
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -42,13 +38,12 @@ SCOPE = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-_sheet            = None
-_last_auth_time   = 0
+_sheet          = None
+_last_auth_time = 0
 
 
 def get_sheet():
     global _sheet, _last_auth_time
-
     now = time.time()
     if _sheet is None or (now - _last_auth_time) > GSHEET_REAUTH_INTERVAL:
         try:
@@ -94,7 +89,6 @@ def update_sheet_tp(row, value):
 
 
 def update_sheet_sl(row, value):
-    """Column C stores live SL for trailing stop tracking."""
     try:
         sheet = get_sheet()
         if sheet is None:
@@ -236,9 +230,6 @@ def get_position_entry(symbol):
 # =====================================================
 
 def has_open_order(symbol):
-    """
-    Returns True if there is any unfilled order for this pair still on the book.
-    """
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
@@ -265,14 +256,10 @@ def has_open_order(symbol):
 
 
 # =====================================================
-# WICK TP DETECTION  (for longs — recent HIGH vs TP)
+# WICK TP DETECTION
 # =====================================================
 
 def get_recent_high(symbol):
-    """
-    Returns the highest high across the last 3 minutes of 1-min candles.
-    Used to detect if a wick already tagged the TP level.
-    """
     try:
         pair_api = fut_pair(symbol)
         url  = "https://public.coindcx.com/market_data/candlesticks"
@@ -327,19 +314,16 @@ def compute_qty(entry_price, symbol):
 
 
 # =====================================================
-# PLACE LONG ORDER  (BUY side only — this bot is long-only)
+# PLACE LONG ORDER
 # =====================================================
 
 def place_long_order(symbol, entry_price, precision):
     entry   = round(entry_price, precision)
-
-    # LONG: TP is ABOVE entry (price needs to rise to hit profit)
-    #       SL is BELOW entry (price falling beyond SL closes trade)
     tp      = round(entry * (1 + TP_PCT), precision)
     sl_base = round(entry * (1 - SL_PCT), precision)
 
-    reward = tp - entry       # how much price needs to rise to hit TP
-    risk   = entry - sl_base  # how much price can fall before SL triggers
+    reward = tp - entry
+    risk   = entry - sl_base
 
     if risk <= 0 or (reward / risk) < MIN_RR:
         rr = round(reward / risk, 2) if risk > 0 else "inf"
@@ -364,14 +348,14 @@ def place_long_order(symbol, entry_price, precision):
     body = {
         "timestamp": int(time.time() * 1000),
         "order": {
-            "side":              "buy",          # ← always BUY — this is a long-only bot
+            "side":              "buy",
             "pair":              fut_pair(symbol),
             "order_type":        "limit_order",
             "price":             entry,
             "total_quantity":    qty,
             "leverage":          LEVERAGE,
-            "take_profit_price": tp,             # TP above entry
-            "stop_loss_price":   sl_base,        # SL below entry
+            "take_profit_price": tp,
+            "stop_loss_price":   sl_base,
         },
     }
 
@@ -444,7 +428,7 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    if len(candles) < EMA_SLOW_PERIOD + 5:
+    if len(candles) < EMA_PERIOD + 3:
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -453,15 +437,17 @@ def check_and_trade(symbol, row, df):
 
     del candles
 
-    ema21_values = compute_ema(closes, EMA_FAST_PERIOD)
-    ema50_values = compute_ema(closes, EMA_SLOW_PERIOD)
+    ema_values = compute_ema(closes, EMA_PERIOD)
     del closes
 
-    ema21 = round(ema21_values[-1], precision)
-    ema50 = round(ema50_values[-1], precision)
+    ema_now  = ema_values[-1]   # current candle's 21 EMA
+    ema_prev = ema_values[-3]   # 2 candles back for 2-bar slope
+
+    ema_slope = round(ema_now - ema_prev, precision)
+    slope_dir = "positive" if ema_now > ema_prev else "negative"
 
     # =========================================================================
-    # GATE 1 — Open position check (order was filled → live position exists)
+    # GATE 1 — Open position check
     # =========================================================================
     positions = get_open_positions()
     for pos in positions:
@@ -473,7 +459,7 @@ def check_and_trade(symbol, row, df):
             return
 
     # =========================================================================
-    # GATE 2 — Open order check (order NOT yet filled, status="open")
+    # GATE 2 — Open order check
     # =========================================================================
     if has_open_order(symbol):
         print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
@@ -489,7 +475,6 @@ def check_and_trade(symbol, row, df):
     try:
         tp_stored = float(tp_raw)
 
-        # For a LONG: TP is hit when price rises TO or ABOVE the TP level
         if last_close >= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"[TP HIT] {symbol} price {last_close} >= TP {tp_stored}")
@@ -504,69 +489,59 @@ def check_and_trade(symbol, row, df):
     except Exception:
         pass
 
-    # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
+    # =========================================================================
+    # STRATEGY CONDITIONS — mirror of short logic, flipped for long
+    # =========================================================================
 
-    # 21 EMA must have a POSITIVE slope (turning up = bullish momentum building)
-    ema21_slope = ema21_values[-1] - ema21_values[-EMA21_SLOPE_BARS]
-    if ema21_slope <= 0:
-        print(f"[SKIP] {symbol} 21 EMA slope not up ({round(ema21_slope, precision)}) | 21 EMA {ema21} | 50 EMA {ema50} | Price {last_close}")
-        return
+    # ── Condition 1 — Last candle closed ABOVE 21 EMA ────────────────────────
+    price_above_ema = last_close > ema_now
 
-    # 50 EMA must be FLAT or POSITIVE (not still strongly falling)
-    ema50_slope     = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
-    ema50_slope_pct = ema50_slope / last_close
-    if ema50_slope_pct < -EMA50_FLAT_THRESHOLD:
-        print(f"[SKIP] {symbol} 50 EMA still falling (slope {round(ema50_slope_pct * 100, 4)}%) | 21 EMA {ema21} | 50 EMA {ema50} | Price {last_close}")
-        return
+    # ── Condition 2 — 21 EMA slope POSITIVE over 2 bars ─────────────────────
+    ema_slope_positive = ema_now > ema_prev
 
-    # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
+    # ── Log current state every cycle ────────────────────────────────────────
+    print(
+        f"[SCAN] {symbol} | "
+        f"Price {last_close} | 21 EMA {round(ema_now, precision)} | "
+        f"EMA slope {ema_slope} ({slope_dir}) | "
+        f"price_above={price_above_ema} ema_slope_positive={ema_slope_positive}"
+    )
 
-    # Macro context: 21 EMA was below 50 EMA (bearish-to-bullish flip in play)
-    macro_bearish_context = ema21 < ema50
-
-    # Price has crossed ABOVE the 21 EMA from below (bullish EMA crossover signal)
-    above_ema21 = last_close > ema21
-
-    # Price has also pushed ABOVE the 50 EMA (full breakout confirmed)
-    above_ema50 = last_close > ema50
-
-    if not macro_bearish_context:
-        print(f"[SKIP] {symbol} 21 EMA {ema21} is already above 50 EMA {ema50} — macro context not bearish-to-bullish | Price {last_close}")
-        return
-
-    if not above_ema21:
-        print(f"[SKIP] {symbol} price {last_close} has not crossed above 21 EMA {ema21} | 50 EMA {ema50}")
-        return
-
-    if not above_ema50:
-        print(f"[SKIP] {symbol} price {last_close} has not cleared above 50 EMA {ema50} | 21 EMA {ema21}")
+    # ── Both conditions must be true ─────────────────────────────────────────
+    if not price_above_ema or not ema_slope_positive:
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} | 21 EMA {ema21} | 50 EMA {ema50} "
-        f"| 21 slope +{round(ema21_slope, precision)} | 50 slope {round(ema50_slope_pct * 100, 4)}% "
+        f"[SIGNAL] {symbol} "
+        f"| Last candle closed above 21 EMA ✓ "
+        f"| EMA slope {ema_slope} (positive) ✓ "
+        f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
         f"| TP {round(last_close * (1 + TP_PCT), precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
 
     # =========================================================================
-    # FINAL GUARD — re-check both states right before placing
-    # Protects against race conditions where state changed mid-scan
+    # FINAL GUARD — re-check everything right before placing
     # =========================================================================
-
-    # Guard 1: active position already open
     live_positions = get_open_positions()
     for pos in live_positions:
         if pos.get("pair") == pair:
             print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
             return
 
-    # Guard 2: unfilled order still on book
     if has_open_order(symbol):
         print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
         return
 
-    # ── Place LONG (BUY) trade ────────────────────────────────────────────────
+    # ── Re-verify last close still above 21 EMA before placing ──────────────
+    if last_close <= ema_now:
+        print(
+            f"[SKIP] {symbol} — last close {last_close} not above "
+            f"21 EMA {round(ema_now, precision)} at placement, aborting"
+        )
+        return
+
+    # ── Place LONG trade ──────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_long_order(
         symbol, last_close, precision
     )
@@ -587,12 +562,10 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>21/50 Breakout Long</code>\n"
+    f"📐 Strategy : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📈 Entry    : <code>Price above 21 &amp; 50 EMA (21 EMA still below 50)</code>\n"
-    f"✅ Context  : <code>21 EMA below 50 EMA (bearish-to-bullish flip)</code>\n"
-    f"📉 21 EMA   : <code>Slope must be positive</code>\n"
-    f"📊 50 EMA   : <code>Slope must be flat or positive</code>\n"
+    f"📈 Entry    : <code>Last candle closed above 21 EMA + EMA slope positive (2-bar)</code>\n"
+    f"✅ Filter   : <code>Dipped coins added manually to sheet</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed above entry</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
