@@ -16,9 +16,17 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_PERIOD       = 21
-TP_PCT           = 0.015
-SL_PCT           = 0.075
 MIN_RR           = 0.05
+
+# ─── DYNAMIC TP SETTINGS ──────────────────────────────────────────────────────
+SWING_LOOKBACK   = 3          # candles each side to confirm a swing high
+RESISTANCE_CANDLES = 200     # how many candles to scan for swing highs
+MIN_TP_PCT       = 0.015      # minimum TP: 1.5% above entry
+MAX_TP_PCT       = 0.08       # maximum TP: 8% above entry (cap)
+FALLBACK_TP_PCT  = 0.015      # fallback fixed TP if no resistance found: 3%
+
+# ─── STOP LOSS ────────────────────────────────────────────────────────────────
+SL_PCT           = 0.075       # tightened to 3% (was 7.5%)
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
 REQUEST_TIMEOUT  = 15
@@ -176,6 +184,51 @@ def compute_ema(closes, period):
 
 
 # =====================================================
+# DYNAMIC TP — NEAREST RESISTANCE (SWING HIGH)
+# =====================================================
+
+def find_nearest_resistance(candles, entry_price, precision):
+    """
+    Scans the last RESISTANCE_CANDLES candles for swing highs above entry.
+    A swing high = candle whose high is greater than SWING_LOOKBACK candles
+    on both its left and right side.
+
+    Returns the nearest (lowest) swing high above entry, capped between
+    MIN_TP_PCT and MAX_TP_PCT. Falls back to FALLBACK_TP_PCT if none found.
+    """
+    highs = [float(c["high"]) for c in candles[-RESISTANCE_CANDLES:]]
+    n     = len(highs)
+    lb    = SWING_LOOKBACK
+
+    swing_highs = []
+
+    for i in range(lb, n - lb):
+        current = highs[i]
+        left    = highs[i - lb : i]
+        right   = highs[i + 1 : i + lb + 1]
+
+        if all(current > h for h in left) and all(current > h for h in right):
+            swing_highs.append(current)
+
+    # Filter: must be above entry, within MIN and MAX TP range
+    min_tp_price = entry_price * (1 + MIN_TP_PCT)
+    max_tp_price = entry_price * (1 + MAX_TP_PCT)
+
+    valid = [h for h in swing_highs if min_tp_price <= h <= max_tp_price]
+
+    if valid:
+        nearest = min(valid)  # closest resistance above entry
+        tp      = round(nearest, precision)
+        print(f"[RESISTANCE TP] Found swing high at {tp} (from {len(valid)} candidates)")
+        return tp, "resistance"
+
+    # Fallback
+    fallback_tp = round(entry_price * (1 + FALLBACK_TP_PCT), precision)
+    print(f"[RESISTANCE TP] No valid swing high found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
+    return fallback_tp, "fallback"
+
+
+# =====================================================
 # OPEN POSITIONS
 # =====================================================
 
@@ -314,13 +367,15 @@ def compute_qty(entry_price, symbol):
 
 
 # =====================================================
-# PLACE LONG ORDER
+# PLACE LONG ORDER — with dynamic TP
 # =====================================================
 
-def place_long_order(symbol, entry_price, precision):
+def place_long_order(symbol, entry_price, precision, candles):
     entry   = round(entry_price, precision)
-    tp      = round(entry * (1 + TP_PCT), precision)
     sl_base = round(entry * (1 - SL_PCT), precision)
+
+    # ── Dynamic TP ────────────────────────────────────────────────────────────
+    tp, tp_type = find_nearest_resistance(candles, entry, precision)
 
     reward = tp - entry
     risk   = entry - sl_base
@@ -331,17 +386,19 @@ def place_long_order(symbol, entry_price, precision):
         send_telegram(
             f"⚠️ <b>LONG SIGNAL SKIPPED — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"❌ Reason : <code>RR {rr} below minimum {MIN_RR}</code>\n"
-            f"📍 Entry  : <code>{entry}</code>\n"
-            f"🎯 TP     : <code>{tp}</code>  (above entry)\n"
-            f"🛑 SL     : <code>{sl_base}</code>  (below entry)"
+            f"❌ Reason  : <code>RR {rr} below minimum {MIN_RR}</code>\n"
+            f"📍 Entry   : <code>{entry}</code>\n"
+            f"🎯 TP      : <code>{tp}</code>  ({tp_type})\n"
+            f"🛑 SL      : <code>{sl_base}</code>  (below entry)"
         )
         return None, None
 
     qty = compute_qty(entry_price, symbol)
 
+    tp_pct = round(((tp - entry) / entry) * 100, 2)
+
     print(
-        f"[LONG TRADE] {symbol} BUY | Entry {entry} | TP {tp} (+{TP_PCT*100:.1f}%) "
+        f"[LONG TRADE] {symbol} BUY | Entry {entry} | TP {tp} (+{tp_pct}% — {tp_type}) "
         f"| SL {sl_base} (-{SL_PCT*100:.0f}%) | RR {round(reward / risk, 2)} | Qty {qty}"
     )
 
@@ -375,9 +432,9 @@ def place_long_order(symbol, entry_price, precision):
         send_telegram(
             f"❌ <b>LONG ORDER REJECTED — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Entry  : <code>{entry}</code>\n"
-            f"🎯 TP     : <code>{tp}</code>  (above entry)\n"
-            f"🛑 SL     : <code>{sl_base}</code>  (below entry)\n"
+            f"📍 Entry   : <code>{entry}</code>\n"
+            f"🎯 TP      : <code>{tp}</code>  ({tp_type})\n"
+            f"🛑 SL      : <code>{sl_base}</code>\n"
             f"⚠️ Response : <code>{str(result)[:200]}</code>"
         )
         return None, None
@@ -392,7 +449,7 @@ def place_long_order(symbol, entry_price, precision):
         f"🟢 <b>NEW LONG (BUY) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry   : <code>{entry}</code>\n"
-        f"🎯 TP      : <code>{tp}</code>  (+{TP_PCT * 100:.1f}% above entry)\n"
+        f"🎯 TP      : <code>{tp}</code>  (+{tp_pct}% — {tp_type})\n"
         f"🛑 SL      : <code>{sl_base}</code>  (-{int(SL_PCT * 100)}% below entry)\n"
         f"📊 RR      : <code>{round(reward / risk, 2)}</code>\n"
         f"📦 Qty     : <code>{qty}</code>\n"
@@ -413,6 +470,7 @@ def check_and_trade(symbol, row, df):
     url      = "https://public.coindcx.com/market_data/candlesticks"
     now      = int(time.time())
 
+    # Fetch enough candles to cover EMA period + slope check + resistance scan
     params = {
         "pair":       pair_api,
         "from":       now - 360000,
@@ -428,20 +486,19 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    if len(candles) < EMA_PERIOD + 3:
+    # Need enough candles for EMA + 10-bar slope + resistance scan
+    if len(candles) < EMA_PERIOD + 11:
         return
 
     precision  = get_precision(candles[-1]["close"])
     closes     = [float(c["close"]) for c in candles]
     last_close = float(candles[-1]["close"])
 
-    del candles
-
     ema_values = compute_ema(closes, EMA_PERIOD)
     del closes
 
-    ema_now  = ema_values[-1]   # current candle's 21 EMA
-    ema_prev = ema_values[-3]   # 2 candles back for 2-bar slope
+    ema_now  = ema_values[-1]    # current candle's 21 EMA
+    ema_prev = ema_values[-11]   # 10 candles back for 10-bar slope
 
     ema_slope = round(ema_now - ema_prev, precision)
     slope_dir = "positive" if ema_now > ema_prev else "negative"
@@ -490,13 +547,13 @@ def check_and_trade(symbol, row, df):
         pass
 
     # =========================================================================
-    # STRATEGY CONDITIONS — mirror of short logic, flipped for long
+    # STRATEGY CONDITIONS
     # =========================================================================
 
     # ── Condition 1 — Last candle closed ABOVE 21 EMA ────────────────────────
     price_above_ema = last_close > ema_now
 
-    # ── Condition 2 — 21 EMA slope POSITIVE over 2 bars ─────────────────────
+    # ── Condition 2 — 21 EMA slope POSITIVE over 10 bars ────────────────────
     ema_slope_positive = ema_now > ema_prev
 
     # ── Log current state every cycle ────────────────────────────────────────
@@ -514,9 +571,8 @@ def check_and_trade(symbol, row, df):
     print(
         f"[SIGNAL] {symbol} "
         f"| Last candle closed above 21 EMA ✓ "
-        f"| EMA slope {ema_slope} (positive) ✓ "
+        f"| EMA slope {ema_slope} (10-bar positive) ✓ "
         f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
-        f"| TP {round(last_close * (1 + TP_PCT), precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
 
@@ -542,8 +598,9 @@ def check_and_trade(symbol, row, df):
         return
 
     # ── Place LONG trade ──────────────────────────────────────────────────────
+    # Pass candles so place_long_order can compute dynamic TP from swing highs
     tp_confirmed, sl_placed = place_long_order(
-        symbol, last_close, precision
+        symbol, last_close, precision, candles
     )
     if tp_confirmed:
         update_sheet_tp(row, tp_confirmed)
@@ -562,13 +619,13 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>21 EMA Breakout Long</code>\n"
-    f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📈 Entry    : <code>Last candle closed above 21 EMA + EMA slope positive (2-bar)</code>\n"
-    f"✅ Filter   : <code>Dipped coins added manually to sheet</code>\n"
-    f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed above entry</code>\n"
-    f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
-    f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+    f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
+    f"⏱ Timeframe  : <code>30 Min</code>\n"
+    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA slope positive (10-bar)</code>\n"
+    f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
+    f"🎯 TP        : <code>Dynamic — nearest swing high resistance (1.5%–8%) | fallback 3%</code>\n"
+    f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
+    f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 30 seconds..."
 )
 
