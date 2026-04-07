@@ -486,8 +486,8 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    # Need enough candles for EMA + 10-bar slope + resistance scan
-    if len(candles) < EMA_PERIOD + 11:
+    # Need enough candles for EMA + 30-bar slope + resistance scan
+    if len(candles) < EMA_PERIOD + 31:
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -498,7 +498,7 @@ def check_and_trade(symbol, row, df):
     del closes
 
     ema_now  = ema_values[-1]    # current candle's 21 EMA
-    ema_prev = ema_values[-11]   # 10 candles back for 10-bar slope
+    ema_prev = ema_values[-31]   # 30 candles back for 30-bar slope
 
     ema_slope = round(ema_now - ema_prev, precision)
     slope_dir = "positive" if ema_now > ema_prev else "negative"
@@ -553,7 +553,7 @@ def check_and_trade(symbol, row, df):
     # ── Condition 1 — Last candle closed ABOVE 21 EMA ────────────────────────
     price_above_ema = last_close > ema_now
 
-    # ── Condition 2 — 21 EMA slope POSITIVE over 10 bars ────────────────────
+    # ── Condition 2 — 21 EMA slope POSITIVE over 30 bars ────────────────────
     ema_slope_positive = ema_now > ema_prev
 
     # ── Log current state every cycle ────────────────────────────────────────
@@ -571,7 +571,7 @@ def check_and_trade(symbol, row, df):
     print(
         f"[SIGNAL] {symbol} "
         f"| Last candle closed above 21 EMA ✓ "
-        f"| EMA slope {ema_slope} (10-bar positive) ✓ "
+        f"| EMA slope {ema_slope} (30-bar positive) ✓ "
         f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
@@ -621,7 +621,7 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA slope positive (10-bar)</code>\n"
+    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA slope positive (30-bar)</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing high resistance (1.5%–8%) | fallback 3%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
