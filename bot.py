@@ -19,24 +19,24 @@ EMA_PERIOD       = 21
 MIN_RR           = 0.05
 
 # ─── DYNAMIC TP SETTINGS ──────────────────────────────────────────────────────
-SWING_LOOKBACK     = 5        # candles each side to confirm a swing high
+SWING_LOOKBACK     = 3        # candles each side to confirm a swing high
 RESISTANCE_CANDLES = 200      # how many candles to scan for swing body highs
-MIN_TP_PCT         = 0.015    # minimum TP: 1.5% above entry
-MAX_TP_PCT         = 0.08     # maximum TP: 8% above entry (cap)
+MIN_TP_PCT         = 0.012    # minimum TP: 1.2% above entry
+MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
 SL_PCT           = 0.075      # 7.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 3          # candles for slope curve (matches Pine _slopeLook = 3)
+LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 3)
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
-FILTER_LOOKBACK  = 25         # how many candles to check (Pine _filterLook = 25)
-MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
+FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
+MIN_BELOW_PERC   = 60         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
