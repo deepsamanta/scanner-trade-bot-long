@@ -23,7 +23,7 @@ SWING_LOOKBACK   = 3          # candles each side to confirm a swing high
 RESISTANCE_CANDLES = 200     # how many candles to scan for swing highs
 MIN_TP_PCT       = 0.015      # minimum TP: 1.5% above entry
 MAX_TP_PCT       = 0.08       # maximum TP: 8% above entry (cap)
-FALLBACK_TP_PCT  = 0.015      # fallback fixed TP if no resistance found: 3%
+FALLBACK_TP_PCT  = 0.01       # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
 SL_PCT           = 0.075       # tightened to 3% (was 7.5%)
@@ -184,47 +184,52 @@ def compute_ema(closes, period):
 
 
 # =====================================================
-# DYNAMIC TP — NEAREST RESISTANCE (SWING HIGH)
+# DYNAMIC TP — NEAREST RESISTANCE (SWING HIGH BODY)
 # =====================================================
 
 def find_nearest_resistance(candles, entry_price, precision):
     """
-    Scans the last RESISTANCE_CANDLES candles for swing highs above entry.
-    A swing high = candle whose high is greater than SWING_LOOKBACK candles
-    on both its left and right side.
+    Scans the last RESISTANCE_CANDLES candles for swing highs based on
+    candle BODY TOPS — max(open, close) — ignoring wicks.
 
-    Returns the nearest (lowest) swing high above entry, capped between
-    MIN_TP_PCT and MAX_TP_PCT. Falls back to FALLBACK_TP_PCT if none found.
+    A swing body high = candle whose body top is greater than SWING_LOOKBACK
+    candles on both its left and right side.
+
+    Returns the nearest (lowest) body-based swing high above entry, capped
+    between MIN_TP_PCT and MAX_TP_PCT. Falls back to FALLBACK_TP_PCT (1%)
+    if none found.
     """
-    highs = [float(c["high"]) for c in candles[-RESISTANCE_CANDLES:]]
-    n     = len(highs)
-    lb    = SWING_LOOKBACK
+    recent_candles = candles[-RESISTANCE_CANDLES:]
+    # Use body top: max(open, close) — ignores wicks entirely
+    body_tops = [max(float(c["open"]), float(c["close"])) for c in recent_candles]
+    n  = len(body_tops)
+    lb = SWING_LOOKBACK
 
-    swing_highs = []
+    swing_body_highs = []
 
     for i in range(lb, n - lb):
-        current = highs[i]
-        left    = highs[i - lb : i]
-        right   = highs[i + 1 : i + lb + 1]
+        current = body_tops[i]
+        left    = body_tops[i - lb : i]
+        right   = body_tops[i + 1 : i + lb + 1]
 
-        if all(current > h for h in left) and all(current > h for h in right):
-            swing_highs.append(current)
+        if all(current > b for b in left) and all(current > b for b in right):
+            swing_body_highs.append(current)
 
     # Filter: must be above entry, within MIN and MAX TP range
     min_tp_price = entry_price * (1 + MIN_TP_PCT)
     max_tp_price = entry_price * (1 + MAX_TP_PCT)
 
-    valid = [h for h in swing_highs if min_tp_price <= h <= max_tp_price]
+    valid = [b for b in swing_body_highs if min_tp_price <= b <= max_tp_price]
 
     if valid:
-        nearest = min(valid)  # closest resistance above entry
+        nearest = min(valid)  # closest body resistance above entry
         tp      = round(nearest, precision)
-        print(f"[RESISTANCE TP] Found swing high at {tp} (from {len(valid)} candidates)")
-        return tp, "resistance"
+        print(f"[BODY RESISTANCE TP] Found swing body high at {tp} (from {len(valid)} candidates)")
+        return tp, "body_resistance"
 
-    # Fallback
+    # Fallback — 1%
     fallback_tp = round(entry_price * (1 + FALLBACK_TP_PCT), precision)
-    print(f"[RESISTANCE TP] No valid swing high found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
+    print(f"[BODY RESISTANCE TP] No valid swing body high found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
     return fallback_tp, "fallback"
 
 
@@ -623,7 +628,7 @@ send_telegram(
     f"⏱ Timeframe  : <code>30 Min</code>\n"
     f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA slope positive (30-bar)</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
-    f"🎯 TP        : <code>Dynamic — nearest swing high resistance (1.5%–8%) | fallback 3%</code>\n"
+    f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 30 seconds..."
