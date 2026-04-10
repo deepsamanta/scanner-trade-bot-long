@@ -19,14 +19,20 @@ EMA_PERIOD       = 21
 MIN_RR           = 0.05
 
 # ─── DYNAMIC TP SETTINGS ──────────────────────────────────────────────────────
-SWING_LOOKBACK   = 3          # candles each side to confirm a swing high
-RESISTANCE_CANDLES = 200     # how many candles to scan for swing highs
-MIN_TP_PCT       = 0.015      # minimum TP: 1.5% above entry
-MAX_TP_PCT       = 0.08       # maximum TP: 8% above entry (cap)
-FALLBACK_TP_PCT  = 0.01       # fallback fixed TP if no resistance found: 1%
+SWING_LOOKBACK     = 3        # candles each side to confirm a swing high
+RESISTANCE_CANDLES = 200      # how many candles to scan for swing body highs
+MIN_TP_PCT         = 0.015    # minimum TP: 1.5% above entry
+MAX_TP_PCT         = 0.08     # maximum TP: 8% above entry (cap)
+FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.075       # tightened to 3% (was 7.5%)
+SL_PCT           = 0.075      # 7.5% fixed below entry
+
+# ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
+LINREG_LOOKBACK  = 30         # number of EMA values used for slope regression
+
+# ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
+SCAN_INTERVAL    = 900        # 15 minutes in seconds
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
 REQUEST_TIMEOUT  = 15
@@ -183,6 +189,33 @@ def compute_ema(closes, period):
     return values
 
 
+def compute_linreg_slope(values):
+    """
+    Fits a linear regression line to the given list of values.
+    Returns the slope (price rise per bar on the fitted line).
+
+    A positive slope confirms the EMA is genuinely trending upward
+    across the full window — not just a momentary uptick between
+    two individual bars.
+
+    Formula:
+        slope = (n·Σxy − Σx·Σy) / (n·Σx² − (Σx)²)
+    where x = bar index (0, 1, ..., n-1), y = EMA value.
+    """
+    n      = len(values)
+    x      = list(range(n))
+    sum_x  = sum(x)
+    sum_y  = sum(values)
+    sum_xy = sum(xi * yi for xi, yi in zip(x, values))
+    sum_x2 = sum(xi * xi for xi in x)
+
+    denom = n * sum_x2 - sum_x ** 2
+    if denom == 0:
+        return 0.0
+
+    return (n * sum_xy - sum_x * sum_y) / denom
+
+
 # =====================================================
 # DYNAMIC TP — NEAREST RESISTANCE (SWING HIGH BODY)
 # =====================================================
@@ -200,7 +233,6 @@ def find_nearest_resistance(candles, entry_price, precision):
     if none found.
     """
     recent_candles = candles[-RESISTANCE_CANDLES:]
-    # Use body top: max(open, close) — ignores wicks entirely
     body_tops = [max(float(c["open"]), float(c["close"])) for c in recent_candles]
     n  = len(body_tops)
     lb = SWING_LOOKBACK
@@ -215,19 +247,17 @@ def find_nearest_resistance(candles, entry_price, precision):
         if all(current > b for b in left) and all(current > b for b in right):
             swing_body_highs.append(current)
 
-    # Filter: must be above entry, within MIN and MAX TP range
     min_tp_price = entry_price * (1 + MIN_TP_PCT)
     max_tp_price = entry_price * (1 + MAX_TP_PCT)
 
     valid = [b for b in swing_body_highs if min_tp_price <= b <= max_tp_price]
 
     if valid:
-        nearest = min(valid)  # closest body resistance above entry
+        nearest = min(valid)
         tp      = round(nearest, precision)
         print(f"[BODY RESISTANCE TP] Found swing body high at {tp} (from {len(valid)} candidates)")
         return tp, "body_resistance"
 
-    # Fallback — 1%
     fallback_tp = round(entry_price * (1 + FALLBACK_TP_PCT), precision)
     print(f"[BODY RESISTANCE TP] No valid swing body high found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
     return fallback_tp, "fallback"
@@ -314,17 +344,21 @@ def has_open_order(symbol):
 
 
 # =====================================================
-# WICK TP DETECTION
+# TP CHECK — recent high over last 15 minutes
 # =====================================================
 
 def get_recent_high(symbol):
+    """
+    Fetches 1-min candles over the last 15 minutes (matching SCAN_INTERVAL)
+    to check if price touched TP via a wick since the last cycle.
+    """
     try:
         pair_api = fut_pair(symbol)
         url  = "https://public.coindcx.com/market_data/candlesticks"
         now  = int(time.time())
         params = {
             "pair":       pair_api,
-            "from":       now - 180,
+            "from":       now - SCAN_INTERVAL,   # last 15 minutes
             "to":         now,
             "resolution": "1",
             "pcode":      "f",
@@ -379,7 +413,6 @@ def place_long_order(symbol, entry_price, precision, candles):
     entry   = round(entry_price, precision)
     sl_base = round(entry * (1 - SL_PCT), precision)
 
-    # ── Dynamic TP ────────────────────────────────────────────────────────────
     tp, tp_type = find_nearest_resistance(candles, entry, precision)
 
     reward = tp - entry
@@ -475,7 +508,6 @@ def check_and_trade(symbol, row, df):
     url      = "https://public.coindcx.com/market_data/candlesticks"
     now      = int(time.time())
 
-    # Fetch enough candles to cover EMA period + slope check + resistance scan
     params = {
         "pair":       pair_api,
         "from":       now - 360000,
@@ -491,8 +523,8 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    # Need enough candles for EMA + 30-bar slope + resistance scan
-    if len(candles) < EMA_PERIOD + 31:
+    # Need enough candles for EMA + linreg lookback
+    if len(candles) < EMA_PERIOD + LINREG_LOOKBACK + 1:
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -502,11 +534,15 @@ def check_and_trade(symbol, row, df):
     ema_values = compute_ema(closes, EMA_PERIOD)
     del closes
 
-    ema_now  = ema_values[-1]    # current candle's 21 EMA
-    ema_prev = ema_values[-31]   # 30 candles back for 30-bar slope
+    ema_now = ema_values[-1]
 
-    ema_slope = round(ema_now - ema_prev, precision)
-    slope_dir = "positive" if ema_now > ema_prev else "negative"
+    # ── Linear regression slope over last LINREG_LOOKBACK EMA values ─────────
+    # slope > 0  →  EMA is genuinely trending up across the full window
+    # slope <= 0 →  EMA is flat or declining, skip
+    ema_window         = ema_values[-LINREG_LOOKBACK:]
+    ema_slope          = compute_linreg_slope(ema_window)
+    ema_slope_positive = ema_slope > 0
+    slope_dir          = "positive" if ema_slope_positive else "negative"
 
     # =========================================================================
     # GATE 1 — Open position check
@@ -558,25 +594,22 @@ def check_and_trade(symbol, row, df):
     # ── Condition 1 — Last candle closed ABOVE 21 EMA ────────────────────────
     price_above_ema = last_close > ema_now
 
-    # ── Condition 2 — 21 EMA slope POSITIVE over 30 bars ────────────────────
-    ema_slope_positive = ema_now > ema_prev
+    # ── Condition 2 — 21 EMA linreg slope POSITIVE over last 30 bars ─────────
 
-    # ── Log current state every cycle ────────────────────────────────────────
     print(
         f"[SCAN] {symbol} | "
         f"Price {last_close} | 21 EMA {round(ema_now, precision)} | "
-        f"EMA slope {ema_slope} ({slope_dir}) | "
+        f"EMA linreg slope {round(ema_slope, precision)} ({slope_dir}) | "
         f"price_above={price_above_ema} ema_slope_positive={ema_slope_positive}"
     )
 
-    # ── Both conditions must be true ─────────────────────────────────────────
     if not price_above_ema or not ema_slope_positive:
         return
 
     print(
         f"[SIGNAL] {symbol} "
         f"| Last candle closed above 21 EMA ✓ "
-        f"| EMA slope {ema_slope} (30-bar positive) ✓ "
+        f"| EMA linreg slope {round(ema_slope, precision)} ({LINREG_LOOKBACK}-bar positive) ✓ "
         f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
@@ -594,7 +627,6 @@ def check_and_trade(symbol, row, df):
         print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
         return
 
-    # ── Re-verify last close still above 21 EMA before placing ──────────────
     if last_close <= ema_now:
         print(
             f"[SKIP] {symbol} — last close {last_close} not above "
@@ -602,8 +634,6 @@ def check_and_trade(symbol, row, df):
         )
         return
 
-    # ── Place LONG trade ──────────────────────────────────────────────────────
-    # Pass candles so place_long_order can compute dynamic TP from swing highs
     tp_confirmed, sl_placed = place_long_order(
         symbol, last_close, precision, candles
     )
@@ -626,12 +656,12 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA slope positive (30-bar)</code>\n"
+    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA linreg slope positive ({LINREG_LOOKBACK}-bar)</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
-    f"🕐 Scanning every 30 seconds..."
+    f"🕐 Scanning every 15 minutes..."
 )
 
 while True:
@@ -639,17 +669,14 @@ while True:
         df = get_sheet_data()
 
         if df.empty:
-            print("[WARN] Sheet returned empty — possible auth issue, retrying in 30s")
-            time.sleep(30)
+            print("[WARN] Sheet returned empty — possible auth issue, retrying in 15 min")
+            time.sleep(SCAN_INTERVAL)
             continue
 
         cycle += 1
         consecutive_errors = 0
 
-        if cycle % 10 == 0:
-            print("----- TRADE SCAN (5 MIN) -----")
-        else:
-            print("----- TP / SL MONITOR (30s) -----")
+        print(f"----- TRADE SCAN — CYCLE {cycle} -----")
 
         for row in range(len(df)):
             pair = df.iloc[row, 0]
@@ -658,7 +685,7 @@ while True:
             symbol = normalize_symbol(pair)
             check_and_trade(symbol, row, df)
 
-        time.sleep(30)
+        time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
         consecutive_errors += 1
