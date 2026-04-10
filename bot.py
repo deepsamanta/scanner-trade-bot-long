@@ -26,7 +26,7 @@ MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.075      # 7.5% fixed below entry
+SL_PCT           = 0.055      # 5.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
 LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 3)
