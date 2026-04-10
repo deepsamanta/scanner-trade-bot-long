@@ -19,7 +19,7 @@ EMA_PERIOD       = 21
 MIN_RR           = 0.05
 
 # ─── DYNAMIC TP SETTINGS ──────────────────────────────────────────────────────
-SWING_LOOKBACK     = 3        # candles each side to confirm a swing high
+SWING_LOOKBACK     = 5        # candles each side to confirm a swing high
 RESISTANCE_CANDLES = 200      # how many candles to scan for swing body highs
 MIN_TP_PCT         = 0.015    # minimum TP: 1.5% above entry
 MAX_TP_PCT         = 0.08     # maximum TP: 8% above entry (cap)
@@ -29,12 +29,17 @@ FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 SL_PCT           = 0.075      # 7.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 30         # number of EMA values used for slope regression
+LINREG_LOOKBACK  = 3          # candles for slope curve (matches Pine _slopeLook = 3)
+
+# ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
+# Before a valid long, price must have spent enough time BELOW the EMA
+# (dipped / consolidated under it). This confirms a proper retest, not a
+# mid-air entry on an already extended move.
+FILTER_LOOKBACK  = 25         # how many candles to check (Pine _filterLook = 25)
+MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
-# Only trade when price is within this % above the 21 EMA.
-# If price has run too far above without retesting, skip — wait for it to
-# pull back close to the EMA before entering. Avoids buying "mid air".
+# Even after the crossover, don't buy if price has already run too far above EMA.
 MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
@@ -197,23 +202,31 @@ def compute_ema(closes, period):
 
 def compute_linreg_slope(values):
     """
-    Fits a linear regression line to the given list of values.
-    Returns the slope (price rise per bar on the fitted line).
+    Exact Python port of the Pine Script f_true_slope() function:
 
-    A positive slope confirms the EMA is genuinely trending upward
-    across the full window — not just a momentary uptick between
-    two individual bars.
+        for i = 0 to len - 1
+            x = len - i        # x counts DOWN: len, len-1, ..., 1
+            y = src[i]         # src[0] = most recent bar
+        slope = (n·ΣXY - ΣX·ΣY) / (n·ΣX2 - (ΣX)^2)
 
-    Formula:
-        slope = (n·Σxy − Σx·Σy) / (n·Σx² − (Σx)²)
-    where x = bar index (0, 1, ..., n-1), y = EMA value.
+    'values' must be ordered newest -> oldest (index 0 = most recent).
+    Call as: compute_linreg_slope(list(reversed(ema_values[-N:])))
+
+    A positive slope means the EMA curve is genuinely bending upward.
     """
     n      = len(values)
-    x      = list(range(n))
-    sum_x  = sum(x)
-    sum_y  = sum(values)
-    sum_xy = sum(xi * yi for xi, yi in zip(x, values))
-    sum_x2 = sum(xi * xi for xi in x)
+    sum_x  = 0.0
+    sum_y  = 0.0
+    sum_xy = 0.0
+    sum_x2 = 0.0
+
+    for i in range(n):
+        x       = n - i          # x: n, n-1, ..., 1  (matches Pine Script)
+        y       = values[i]      # values[0] = most recent
+        sum_x  += x
+        sum_y  += y
+        sum_xy += x * y
+        sum_x2 += x * x
 
     denom = n * sum_x2 - sum_x ** 2
     if denom == 0:
@@ -540,15 +553,26 @@ def check_and_trade(symbol, row, df):
     ema_values = compute_ema(closes, EMA_PERIOD)
     del closes
 
-    ema_now = ema_values[-1]
+    ema_now  = ema_values[-1]
+    ema_prev = ema_values[-2]   # one bar back — used for crossover detection
 
-    # ── Linear regression slope over last LINREG_LOOKBACK EMA values ─────────
-    # slope > 0  →  EMA is genuinely trending up across the full window
-    # slope <= 0 →  EMA is flat or declining, skip
-    ema_window         = ema_values[-LINREG_LOOKBACK:]
+    # ── Linear regression slope — Pine Script formula (newest first) ──────────
+    # Pass last LINREG_LOOKBACK EMA values in newest->oldest order
+    ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
     ema_slope          = compute_linreg_slope(ema_window)
+    ema_slope_prev     = compute_linreg_slope(list(reversed(ema_values[-LINREG_LOOKBACK - 1:-1])))
     ema_slope_positive = ema_slope > 0
     slope_dir          = "positive" if ema_slope_positive else "negative"
+
+    # ── Consolidation Filter (Pine _isConsolidating) ──────────────────────────
+    # At least MIN_BELOW_PERC % of the last FILTER_LOOKBACK candles must have
+    # closed BELOW the EMA — confirms price dipped/retested before breakout.
+    bars_below = sum(
+        1 for i in range(1, FILTER_LOOKBACK + 1)
+        if float(candles[-(i + 1)]["close"]) < float(ema_values[-(i + 1)])
+    ) if len(candles) > FILTER_LOOKBACK + 1 else 0
+    perc_below       = (bars_below / FILTER_LOOKBACK) * 100
+    is_consolidating = perc_below >= MIN_BELOW_PERC
 
     # =========================================================================
     # GATE 1 — Open position check
@@ -597,41 +621,55 @@ def check_and_trade(symbol, row, df):
     # STRATEGY CONDITIONS
     # =========================================================================
 
-    # ── Condition 1 — Last candle closed ABOVE 21 EMA ────────────────────────
-    price_above_ema = last_close > ema_now
+    # ── Trigger logic — mirrors Pine Script scenarios ────────────────────────
+    #
+    # Scenario 1: EMA slope JUST turned positive (crossover above 0)
+    #             AND price is already above EMA
+    #             → EMA curve just started bending up, price already broke out
+    #
+    # Scenario 2: Price JUST crossed above EMA (close crossover)
+    #             AND slope is already positive
+    #             → Fresh EMA breakout while trend is already pointing up
+    #
+    # Both scenarios also require:
+    #   - Consolidation: enough bars recently below EMA (proper retest)
+    #   - Proximity: price hasn't run too far above EMA already
 
-    # ── Condition 2 — 21 EMA linreg slope POSITIVE over last 30 bars ─────────
+    curve_just_turned_positive = (ema_slope > 0) and (ema_slope_prev <= 0)
+    price_just_crossed_above   = (last_close > ema_now) and (float(candles[-2]["close"]) <= ema_prev)
 
-    # ── Condition 3 — Price is CLOSE to the EMA (within MAX_EMA_DISTANCE_PCT) ─
-    # If price has already run far above the EMA without retesting it, we are
-    # buying "mid air". Wait for price to pull back near the EMA first.
+    scenario1 = curve_just_turned_positive and (last_close > ema_now)
+    scenario2 = price_just_crossed_above and ema_slope_positive
+
     ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
     price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
 
     print(
-        f"[SCAN] {symbol} | "
-        f"Price {last_close} | 21 EMA {round(ema_now, precision)} | "
-        f"EMA dist {round(ema_distance_pct * 100, 2)}% (max {MAX_EMA_DISTANCE_PCT * 100}%) | "
-        f"EMA linreg slope {round(ema_slope, precision)} ({slope_dir}) | "
-        f"price_above={price_above_ema} near_ema={price_near_ema} ema_slope_positive={ema_slope_positive}"
+        f"[SCAN] {symbol} | Price {last_close} | 21 EMA {round(ema_now, precision)} | "
+        f"slope {round(ema_slope, precision)} ({slope_dir}) | "
+        f"below_EMA {round(perc_below, 1)}% (need {MIN_BELOW_PERC}%) | "
+        f"dist {round(ema_distance_pct * 100, 2)}% | "
+        f"s1={scenario1} s2={scenario2} consol={is_consolidating} near={price_near_ema}"
     )
 
-    if not price_above_ema or not ema_slope_positive:
+    if not (scenario1 or scenario2):
+        return
+
+    if not is_consolidating:
+        print(f"[SKIP] {symbol} — consolidation filter failed ({round(perc_below,1)}% below EMA, need {MIN_BELOW_PERC}%)")
         return
 
     if not price_near_ema:
-        print(
-            f"[SKIP] {symbol} — price is {round(ema_distance_pct * 100, 2)}% above 21 EMA "
-            f"(max allowed {MAX_EMA_DISTANCE_PCT * 100}%) — waiting for retest"
-        )
+        print(f"[SKIP] {symbol} — price {round(ema_distance_pct*100,2)}% above EMA, exceeds {MAX_EMA_DISTANCE_PCT*100}% max — waiting for retest")
         return
 
+    trig = "Scenario1 (curve turned +)" if scenario1 else "Scenario2 (price crossover)"
     print(
-        f"[SIGNAL] {symbol} "
-        f"| Last candle closed above 21 EMA ✓ "
-        f"| EMA linreg slope {round(ema_slope, precision)} ({LINREG_LOOKBACK}-bar positive) ✓ "
-        f"| Price within {round(ema_distance_pct * 100, 2)}% of EMA ✓ "
-        f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
+        f"[SIGNAL] {symbol} | {trig} ✓ "
+        f"| slope {round(ema_slope, precision)} ✓ "
+        f"| {round(perc_below,1)}% bars below EMA ✓ "
+        f"| dist {round(ema_distance_pct*100,2)}% ✓ "
+        f"| Price {last_close} | EMA {round(ema_now, precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
 
@@ -677,7 +715,7 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA linreg slope positive ({LINREG_LOOKBACK}-bar) + price within {int(MAX_EMA_DISTANCE_PCT*100)}% of EMA</code>\n"
+    f"📈 Entry     : <code>Scenario1 (slope crossover 0 + price>EMA) OR Scenario2 (price crossover EMA + slope>0) | consol {MIN_BELOW_PERC}% bars below | dist <{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
