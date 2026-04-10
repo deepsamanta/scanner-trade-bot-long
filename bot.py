@@ -31,6 +31,12 @@ SL_PCT           = 0.075      # 7.5% fixed below entry
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
 LINREG_LOOKBACK  = 30         # number of EMA values used for slope regression
 
+# ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
+# Only trade when price is within this % above the 21 EMA.
+# If price has run too far above without retesting, skip — wait for it to
+# pull back close to the EMA before entering. Avoids buying "mid air".
+MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
+
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = 900        # 15 minutes in seconds
 
@@ -596,20 +602,35 @@ def check_and_trade(symbol, row, df):
 
     # ── Condition 2 — 21 EMA linreg slope POSITIVE over last 30 bars ─────────
 
+    # ── Condition 3 — Price is CLOSE to the EMA (within MAX_EMA_DISTANCE_PCT) ─
+    # If price has already run far above the EMA without retesting it, we are
+    # buying "mid air". Wait for price to pull back near the EMA first.
+    ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
+    price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
+
     print(
         f"[SCAN] {symbol} | "
         f"Price {last_close} | 21 EMA {round(ema_now, precision)} | "
+        f"EMA dist {round(ema_distance_pct * 100, 2)}% (max {MAX_EMA_DISTANCE_PCT * 100}%) | "
         f"EMA linreg slope {round(ema_slope, precision)} ({slope_dir}) | "
-        f"price_above={price_above_ema} ema_slope_positive={ema_slope_positive}"
+        f"price_above={price_above_ema} near_ema={price_near_ema} ema_slope_positive={ema_slope_positive}"
     )
 
     if not price_above_ema or not ema_slope_positive:
+        return
+
+    if not price_near_ema:
+        print(
+            f"[SKIP] {symbol} — price is {round(ema_distance_pct * 100, 2)}% above 21 EMA "
+            f"(max allowed {MAX_EMA_DISTANCE_PCT * 100}%) — waiting for retest"
+        )
         return
 
     print(
         f"[SIGNAL] {symbol} "
         f"| Last candle closed above 21 EMA ✓ "
         f"| EMA linreg slope {round(ema_slope, precision)} ({LINREG_LOOKBACK}-bar positive) ✓ "
+        f"| Price within {round(ema_distance_pct * 100, 2)}% of EMA ✓ "
         f"| Price {last_close} | 21 EMA {round(ema_now, precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
@@ -656,7 +677,7 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA linreg slope positive ({LINREG_LOOKBACK}-bar)</code>\n"
+    f"📈 Entry     : <code>Last candle closed above 21 EMA + EMA linreg slope positive ({LINREG_LOOKBACK}-bar) + price within {int(MAX_EMA_DISTANCE_PCT*100)}% of EMA</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
