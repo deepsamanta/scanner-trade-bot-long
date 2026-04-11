@@ -26,17 +26,24 @@ MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.055      # 5.5% fixed below entry
+SL_PCT           = 0.04      # 4% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 3)
+LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
+
+# ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
+# Before placing a long, verify that the 4H timeframe also shows bullish momentum.
+# We fetch the last N 4H candles and compute a linear regression slope on their
+# closes using the exact same formula as the 30-min slope. The slope must be
+# positive (upward-bending curve on 4H) — if not, the trade is skipped.
+LINREG_4H_LOOKBACK = 3        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
 FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
-MIN_BELOW_PERC   = 60         # min % of those candles that must be below EMA
+MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
@@ -233,6 +240,65 @@ def compute_linreg_slope(values):
         return 0.0
 
     return (n * sum_xy - sum_x * sum_y) / denom
+
+
+# =====================================================
+# 4H TREND FILTER — linear regression slope on closes
+# =====================================================
+
+def check_4h_slope_positive(symbol):
+    """
+    Fetches the last LINREG_4H_LOOKBACK + a small buffer of 4-hour candles
+    and computes a linear regression slope on their closing prices using the
+    exact same formula as the 30-min EMA slope.
+
+    Returns True  → slope is positive  (4H trend is rising, allow trade)
+    Returns False → slope is flat/negative (4H trend not confirmed, skip trade)
+
+    The closes are passed newest-first to match compute_linreg_slope()'s
+    expected ordering (index 0 = most recent bar).
+    """
+    try:
+        pair_api = fut_pair(symbol)
+        url      = "https://public.coindcx.com/market_data/candlesticks"
+        now      = int(time.time())
+
+        # Fetch enough 4H candles: lookback + a small safety buffer
+        fetch_seconds = (LINREG_4H_LOOKBACK + 5) * 4 * 3600
+
+        params = {
+            "pair":       pair_api,
+            "from":       now - fetch_seconds,
+            "to":         now,
+            "resolution": "240",   # 240 minutes = 4 hours
+            "pcode":      "f",
+        }
+
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+
+        if len(candles) < LINREG_4H_LOOKBACK:
+            print(f"[4H FILTER] {symbol} — not enough 4H candles ({len(candles)}), skipping filter (allow trade)")
+            return True
+
+        # Take the last LINREG_4H_LOOKBACK closes, newest first
+        recent_closes = [float(c["close"]) for c in candles[-LINREG_4H_LOOKBACK:]]
+        recent_closes_newest_first = list(reversed(recent_closes))
+
+        slope_4h = compute_linreg_slope(recent_closes_newest_first)
+        is_positive = slope_4h > 0
+
+        print(
+            f"[4H FILTER] {symbol} — last {LINREG_4H_LOOKBACK} 4H closes: "
+            f"{[round(p, 4) for p in recent_closes]} | "
+            f"slope={round(slope_4h, 6)} | {'✅ POSITIVE' if is_positive else '❌ NEGATIVE/FLAT'}"
+        )
+
+        return is_positive
+
+    except Exception as e:
+        print(f"[4H FILTER] {symbol} — fetch error: {e} — skipping filter (allow trade)")
+        return True
 
 
 # =====================================================
@@ -674,6 +740,19 @@ def check_and_trade(symbol, row, df):
     )
 
     # =========================================================================
+    # GATE 3 — 4H LINEAR REGRESSION SLOPE FILTER
+    # The last 4 four-hour candle closes must form a positive linear regression
+    # slope (same formula as the 30-min slope). This ensures the higher
+    # timeframe trend is rising before we enter on the 30-min signal.
+    # =========================================================================
+    if not check_4h_slope_positive(symbol):
+        print(
+            f"[SKIP] {symbol} — 4H linreg slope is negative/flat over last "
+            f"{LINREG_4H_LOOKBACK} candles — higher timeframe not bullish, skipping"
+        )
+        return
+
+    # =========================================================================
     # FINAL GUARD — re-check everything right before placing
     # =========================================================================
     live_positions = get_open_positions()
@@ -717,6 +796,7 @@ send_telegram(
     f"⏱ Timeframe  : <code>30 Min</code>\n"
     f"📈 Entry     : <code>Scenario1 (slope crossover 0 + price>EMA) OR Scenario2 (price crossover EMA + slope>0) | consol {MIN_BELOW_PERC}% bars below | dist <{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
+    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H closes must be positive</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
