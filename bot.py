@@ -26,24 +26,24 @@ MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.055      # 5.5% fixed below entry
+SL_PCT           = 0.055      # 4.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
+LINREG_LOOKBACK  = 10          # candles for slope curve (matches Pine _slopeLook = 4)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
 # Before placing a long, verify that the 4H timeframe also shows bullish momentum.
 # We fetch the last N 4H candles and compute a linear regression slope on their
 # closes using the exact same formula as the 30-min slope. The slope must be
 # positive (upward-bending curve on 4H) — if not, the trade is skipped.
-LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
+LINREG_4H_LOOKBACK = 3        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
-FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
-MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
+FILTER_LOOKBACK  = 60         # how many candles to check (Pine _filterLook = 60)
+MIN_BELOW_PERC   = 30         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
