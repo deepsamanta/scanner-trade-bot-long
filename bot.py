@@ -29,7 +29,7 @@ FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 SL_PCT           = 0.055      # 5.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 10          # candles for slope curve (matches Pine _slopeLook = 4)
+LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
 # Before placing a long, verify that the 4H timeframe also shows bullish momentum.
@@ -716,16 +716,6 @@ def check_and_trade(symbol, row, df):
         print(f"[SKIP] {symbol} — price {round(ema_distance_pct*100,2)}% above EMA, exceeds {MAX_EMA_DISTANCE_PCT*100}% max — waiting for retest")
         return
 
-    print(
-        f"[SIGNAL] {symbol} | all conditions met ✓ "
-        f"| slope30m {round(ema_slope, precision)} ✓ "
-        f"| slope4H {slope_4h_str} ✓ "
-        f"| 4H_below_EMA {round(perc_below_4h, 1)}% ✓ "
-        f"| dist {round(ema_distance_pct*100,2)}% ✓ "
-        f"| Price {last_close} | EMA {round(ema_now, precision)} "
-        f"| SL {round(last_close * (1 - SL_PCT), precision)}"
-    )
-
     # =========================================================================
     # GATE 3 — 4H SLOPE + 4H CONSOLIDATION FILTER
     # =========================================================================
@@ -742,6 +732,16 @@ def check_and_trade(symbol, row, df):
             f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, need {MIN_BELOW_PERC}%)"
         )
         return
+
+    print(
+        f"[SIGNAL] {symbol} | all conditions met ✓ "
+        f"| slope30m {round(ema_slope, precision)} ✓ "
+        f"| slope4H {slope_4h_str} ✓ "
+        f"| 4H_below_EMA {round(perc_below_4h, 1)}% ✓ "
+        f"| dist {round(ema_distance_pct*100,2)}% ✓ "
+        f"| Price {last_close} | EMA {round(ema_now, precision)} "
+        f"| SL {round(last_close * (1 - SL_PCT), precision)}"
+    )
 
     # =========================================================================
     # FINAL GUARD — re-check everything right before placing
@@ -785,9 +785,9 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Scenario1 (slope crossover 0 + price>EMA) OR Scenario2 (price crossover EMA + slope>0) | consol {MIN_BELOW_PERC}% bars below | dist <{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
+    f"📈 Entry     : <code>Price > 21 EMA | 30m slope > 0 | dist <{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
-    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H closes must be positive</code>\n"
+    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
