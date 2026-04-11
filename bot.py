@@ -26,24 +26,24 @@ MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.055      # 4.5% fixed below entry
+SL_PCT           = 0.055      # 5.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 10          # candles for slope curve (matches Pine _slopeLook = 4)
+LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
 # Before placing a long, verify that the 4H timeframe also shows bullish momentum.
 # We fetch the last N 4H candles and compute a linear regression slope on their
 # closes using the exact same formula as the 30-min slope. The slope must be
 # positive (upward-bending curve on 4H) — if not, the trade is skipped.
-LINREG_4H_LOOKBACK = 3        # number of 4H candles to use for the slope check
+LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
-FILTER_LOOKBACK  = 60         # how many candles to check (Pine _filterLook = 60)
-MIN_BELOW_PERC   = 30         # min % of those candles that must be below EMA
+FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
+MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
@@ -614,13 +614,11 @@ def check_and_trade(symbol, row, df):
     del closes
 
     ema_now  = ema_values[-1]
-    ema_prev = ema_values[-2]   # one bar back — used for crossover detection
 
     # ── Linear regression slope — Pine Script formula (newest first) ──────────
     # Pass last LINREG_LOOKBACK EMA values in newest->oldest order
     ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
     ema_slope          = compute_linreg_slope(ema_window)
-    ema_slope_prev     = compute_linreg_slope(list(reversed(ema_values[-LINREG_LOOKBACK - 1:-1])))
     ema_slope_positive = ema_slope > 0
     slope_dir          = "positive" if ema_slope_positive else "negative"
 
@@ -695,14 +693,9 @@ def check_and_trade(symbol, row, df):
     #   - Consolidation: enough bars recently below EMA (proper retest)
     #   - Proximity: price hasn't run too far above EMA already
 
-    curve_just_turned_positive = (ema_slope > 0) and (ema_slope_prev <= 0)
-    price_just_crossed_above   = (last_close > ema_now) and (float(candles[-2]["close"]) <= ema_prev)
-
-    scenario1 = curve_just_turned_positive and (last_close > ema_now)
-    scenario2 = price_just_crossed_above and ema_slope_positive
-
     ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
     price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
+    price_above_ema  = last_close > ema_now
 
     # ── Fetch 4H slope here so it appears in every [SCAN] line ───────────────
     slope_4h_ok, slope_4h_val = check_4h_slope_positive(symbol)
@@ -717,10 +710,14 @@ def check_and_trade(symbol, row, df):
         f"slope4H {slope_4h_str} | "
         f"below_EMA {round(perc_below, 1)}% (need {MIN_BELOW_PERC}%) | "
         f"dist {round(ema_distance_pct * 100, 2)}% | "
-        f"s1={scenario1} s2={scenario2} consol={is_consolidating} near={price_near_ema}"
+        f"above_ema={price_above_ema} slope_ok={ema_slope_positive} consol={is_consolidating} near={price_near_ema}"
     )
 
-    if not (scenario1 or scenario2):
+    if not price_above_ema:
+        return
+
+    if not ema_slope_positive:
+        print(f"[SKIP] {symbol} — 30m slope is negative/flat")
         return
 
     if not is_consolidating:
@@ -731,10 +728,10 @@ def check_and_trade(symbol, row, df):
         print(f"[SKIP] {symbol} — price {round(ema_distance_pct*100,2)}% above EMA, exceeds {MAX_EMA_DISTANCE_PCT*100}% max — waiting for retest")
         return
 
-    trig = "Scenario1 (curve turned +)" if scenario1 else "Scenario2 (price crossover)"
     print(
-        f"[SIGNAL] {symbol} | {trig} ✓ "
-        f"| slope {round(ema_slope, precision)} ✓ "
+        f"[SIGNAL] {symbol} | all conditions met ✓ "
+        f"| slope30m {round(ema_slope, precision)} ✓ "
+        f"| slope4H {slope_4h_str} ✓ "
         f"| {round(perc_below,1)}% bars below EMA ✓ "
         f"| dist {round(ema_distance_pct*100,2)}% ✓ "
         f"| Price {last_close} | EMA {round(ema_now, precision)} "
