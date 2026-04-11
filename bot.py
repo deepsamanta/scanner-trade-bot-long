@@ -26,7 +26,7 @@ MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
 FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.04      # 4% fixed below entry
+SL_PCT           = 0.055      # 5.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
 LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
@@ -36,7 +36,7 @@ LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook
 # We fetch the last N 4H candles and compute a linear regression slope on their
 # closes using the exact same formula as the 30-min slope. The slope must be
 # positive (upward-bending curve on 4H) — if not, the trade is skipped.
-LINREG_4H_LOOKBACK = 3        # number of 4H candles to use for the slope check
+LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid long, price must have spent enough time BELOW the EMA
@@ -288,17 +288,11 @@ def check_4h_slope_positive(symbol):
         slope_4h = compute_linreg_slope(recent_closes_newest_first)
         is_positive = slope_4h > 0
 
-        print(
-            f"[4H FILTER] {symbol} — last {LINREG_4H_LOOKBACK} 4H closes: "
-            f"{[round(p, 4) for p in recent_closes]} | "
-            f"slope={round(slope_4h, 6)} | {'✅ POSITIVE' if is_positive else '❌ NEGATIVE/FLAT'}"
-        )
-
-        return is_positive
+        return is_positive, slope_4h
 
     except Exception as e:
         print(f"[4H FILTER] {symbol} — fetch error: {e} — skipping filter (allow trade)")
-        return True
+        return True, None
 
 
 # =====================================================
@@ -710,9 +704,17 @@ def check_and_trade(symbol, row, df):
     ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
     price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
 
+    # ── Fetch 4H slope here so it appears in every [SCAN] line ───────────────
+    slope_4h_ok, slope_4h_val = check_4h_slope_positive(symbol)
+    slope_4h_str = (
+        f"{round(slope_4h_val, 6)} ({'✅' if slope_4h_ok else '❌'})"
+        if slope_4h_val is not None else "N/A"
+    )
+
     print(
         f"[SCAN] {symbol} | Price {last_close} | 21 EMA {round(ema_now, precision)} | "
-        f"slope {round(ema_slope, precision)} ({slope_dir}) | "
+        f"slope30m {round(ema_slope, precision)} ({slope_dir}) | "
+        f"slope4H {slope_4h_str} | "
         f"below_EMA {round(perc_below, 1)}% (need {MIN_BELOW_PERC}%) | "
         f"dist {round(ema_distance_pct * 100, 2)}% | "
         f"s1={scenario1} s2={scenario2} consol={is_consolidating} near={price_near_ema}"
@@ -745,10 +747,10 @@ def check_and_trade(symbol, row, df):
     # slope (same formula as the 30-min slope). This ensures the higher
     # timeframe trend is rising before we enter on the 30-min signal.
     # =========================================================================
-    if not check_4h_slope_positive(symbol):
+    if not slope_4h_ok:
         print(
             f"[SKIP] {symbol} — 4H linreg slope is negative/flat over last "
-            f"{LINREG_4H_LOOKBACK} candles — higher timeframe not bullish, skipping"
+            f"{LINREG_4H_LOOKBACK} candles (slope={slope_4h_str}) — higher timeframe not bullish, skipping"
         )
         return
 
