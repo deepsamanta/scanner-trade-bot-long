@@ -263,8 +263,8 @@ def check_4h_slope_positive(symbol):
         url      = "https://public.coindcx.com/market_data/candlesticks"
         now      = int(time.time())
 
-        # Fetch enough 4H candles: lookback + a small safety buffer
-        fetch_seconds = (LINREG_4H_LOOKBACK + 5) * 4 * 3600
+        # Fetch enough 4H candles for 21 EMA + LINREG_4H_LOOKBACK + safety buffer
+        fetch_seconds = (EMA_PERIOD + LINREG_4H_LOOKBACK + 5) * 4 * 3600
 
         params = {
             "pair":       pair_api,
@@ -277,16 +277,20 @@ def check_4h_slope_positive(symbol):
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         candles  = sorted(response.json()["data"], key=lambda x: x["time"])
 
-        if len(candles) < LINREG_4H_LOOKBACK:
-            print(f"[4H FILTER] {symbol} — not enough 4H candles ({len(candles)}), skipping filter (allow trade)")
-            return True
+        # Need enough candles to compute 21 EMA + LINREG_4H_LOOKBACK slope values
+        min_required = EMA_PERIOD + LINREG_4H_LOOKBACK
+        if len(candles) < min_required:
+            print(f"[4H FILTER] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filter (allow trade)")
+            return True, None
 
-        # Take the last LINREG_4H_LOOKBACK closes, newest first
-        recent_closes = [float(c["close"]) for c in candles[-LINREG_4H_LOOKBACK:]]
-        recent_closes_newest_first = list(reversed(recent_closes))
+        # Compute 21 EMA on 4H closes — same as 30m side
+        closes_4h     = [float(c["close"]) for c in candles]
+        ema_4h        = compute_ema(closes_4h, EMA_PERIOD)
 
-        slope_4h = compute_linreg_slope(recent_closes_newest_first)
-        is_positive = slope_4h > 0
+        # Run linreg slope on last LINREG_4H_LOOKBACK EMA values, newest first
+        ema_4h_window = list(reversed(ema_4h[-LINREG_4H_LOOKBACK:]))
+        slope_4h      = compute_linreg_slope(ema_4h_window)
+        is_positive   = slope_4h > 0
 
         return is_positive, slope_4h
 
