@@ -42,8 +42,8 @@ LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
-FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
-MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
+FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 50)
+MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
