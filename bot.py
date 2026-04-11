@@ -42,8 +42,8 @@ LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 # Before a valid long, price must have spent enough time BELOW the EMA
 # (dipped / consolidated under it). This confirms a proper retest, not a
 # mid-air entry on an already extended move.
-FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 25)
-MIN_BELOW_PERC   = 35         # min % of those candles that must be below EMA
+FILTER_LOOKBACK  = 30         # how many candles to check (Pine _filterLook = 25)
+MIN_BELOW_PERC   = 55         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover, don't buy if price has already run too far above EMA.
@@ -246,25 +246,30 @@ def compute_linreg_slope(values):
 # 4H TREND FILTER — linear regression slope on closes
 # =====================================================
 
-def check_4h_slope_positive(symbol):
+def get_4h_data(symbol):
     """
-    Fetches the last LINREG_4H_LOOKBACK + a small buffer of 4-hour candles
-    and computes a linear regression slope on their closing prices using the
-    exact same formula as the 30-min EMA slope.
+    Fetches 4H candles, computes the 21 EMA on them, then returns:
+      - slope_ok       : bool   — linreg slope on last 4 EMA values is positive
+      - slope_4h       : float  — raw slope value (for logging)
+      - is_consolidating: bool  — >= MIN_BELOW_PERC% of last FILTER_LOOKBACK 4H
+                                  candles closed below the 4H EMA (same logic as
+                                  the old 30m consolidation filter, now on 4H)
+      - perc_below_4h  : float  — actual % below for logging
 
-    Returns True  → slope is positive  (4H trend is rising, allow trade)
-    Returns False → slope is flat/negative (4H trend not confirmed, skip trade)
-
-    The closes are passed newest-first to match compute_linreg_slope()'s
-    expected ordering (index 0 = most recent bar).
+    All computed from the same single API call to avoid duplicate fetches.
+    On error, returns fail-open defaults so the trade is not blocked.
     """
     try:
         pair_api = fut_pair(symbol)
         url      = "https://public.coindcx.com/market_data/candlesticks"
         now      = int(time.time())
 
-        # Fetch enough 4H candles for 21 EMA + LINREG_4H_LOOKBACK + safety buffer
-        fetch_seconds = (EMA_PERIOD + LINREG_4H_LOOKBACK + 5) * 4 * 3600
+        # Need: EMA_PERIOD candles to seed the EMA
+        #       + FILTER_LOOKBACK candles for consolidation check
+        #       + LINREG_4H_LOOKBACK candles for slope
+        #       + safety buffer
+        fetch_candles = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK + 10
+        fetch_seconds = fetch_candles * 4 * 3600
 
         params = {
             "pair":       pair_api,
@@ -277,26 +282,33 @@ def check_4h_slope_positive(symbol):
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         candles  = sorted(response.json()["data"], key=lambda x: x["time"])
 
-        # Need enough candles to compute 21 EMA + LINREG_4H_LOOKBACK slope values
-        min_required = EMA_PERIOD + LINREG_4H_LOOKBACK
+        min_required = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK
         if len(candles) < min_required:
-            print(f"[4H FILTER] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filter (allow trade)")
-            return True, None
+            print(f"[4H] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filters (allow trade)")
+            return True, None, True, 0.0
 
-        # Compute 21 EMA on 4H closes — same as 30m side
-        closes_4h     = [float(c["close"]) for c in candles]
-        ema_4h        = compute_ema(closes_4h, EMA_PERIOD)
+        # ── 21 EMA on 4H closes ───────────────────────────────────────────────
+        closes_4h = [float(c["close"]) for c in candles]
+        ema_4h    = compute_ema(closes_4h, EMA_PERIOD)
 
-        # Run linreg slope on last LINREG_4H_LOOKBACK EMA values, newest first
+        # ── Linreg slope on last LINREG_4H_LOOKBACK 4H EMA values ────────────
         ema_4h_window = list(reversed(ema_4h[-LINREG_4H_LOOKBACK:]))
         slope_4h      = compute_linreg_slope(ema_4h_window)
-        is_positive   = slope_4h > 0
+        slope_ok      = slope_4h > 0
 
-        return is_positive, slope_4h
+        # ── Consolidation: % of last FILTER_LOOKBACK 4H candles below 4H EMA ─
+        bars_below_4h = sum(
+            1 for i in range(1, FILTER_LOOKBACK + 1)
+            if float(candles[-(i + 1)]["close"]) < float(ema_4h[-(i + 1)])
+        ) if len(candles) > FILTER_LOOKBACK + 1 else 0
+        perc_below_4h   = (bars_below_4h / FILTER_LOOKBACK) * 100
+        is_consolidating = perc_below_4h >= MIN_BELOW_PERC
+
+        return slope_ok, slope_4h, is_consolidating, perc_below_4h
 
     except Exception as e:
-        print(f"[4H FILTER] {symbol} — fetch error: {e} — skipping filter (allow trade)")
-        return True, None
+        print(f"[4H] {symbol} — fetch error: {e} — skipping filters (allow trade)")
+        return True, None, True, 0.0
 
 
 # =====================================================
@@ -626,16 +638,6 @@ def check_and_trade(symbol, row, df):
     ema_slope_positive = ema_slope > 0
     slope_dir          = "positive" if ema_slope_positive else "negative"
 
-    # ── Consolidation Filter (Pine _isConsolidating) ──────────────────────────
-    # At least MIN_BELOW_PERC % of the last FILTER_LOOKBACK candles must have
-    # closed BELOW the EMA — confirms price dipped/retested before breakout.
-    bars_below = sum(
-        1 for i in range(1, FILTER_LOOKBACK + 1)
-        if float(candles[-(i + 1)]["close"]) < float(ema_values[-(i + 1)])
-    ) if len(candles) > FILTER_LOOKBACK + 1 else 0
-    perc_below       = (bars_below / FILTER_LOOKBACK) * 100
-    is_consolidating = perc_below >= MIN_BELOW_PERC
-
     # =========================================================================
     # GATE 1 — Open position check
     # =========================================================================
@@ -683,26 +685,12 @@ def check_and_trade(symbol, row, df):
     # STRATEGY CONDITIONS
     # =========================================================================
 
-    # ── Trigger logic — mirrors Pine Script scenarios ────────────────────────
-    #
-    # Scenario 1: EMA slope JUST turned positive (crossover above 0)
-    #             AND price is already above EMA
-    #             → EMA curve just started bending up, price already broke out
-    #
-    # Scenario 2: Price JUST crossed above EMA (close crossover)
-    #             AND slope is already positive
-    #             → Fresh EMA breakout while trend is already pointing up
-    #
-    # Both scenarios also require:
-    #   - Consolidation: enough bars recently below EMA (proper retest)
-    #   - Proximity: price hasn't run too far above EMA already
-
     ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
     price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
     price_above_ema  = last_close > ema_now
 
-    # ── Fetch 4H slope here so it appears in every [SCAN] line ───────────────
-    slope_4h_ok, slope_4h_val = check_4h_slope_positive(symbol)
+    # ── Fetch 4H data (slope + consolidation) — single API call ─────────────
+    slope_4h_ok, slope_4h_val, is_consolidating, perc_below_4h = get_4h_data(symbol)
     slope_4h_str = (
         f"{round(slope_4h_val, 6)} ({'✅' if slope_4h_ok else '❌'})"
         if slope_4h_val is not None else "N/A"
@@ -712,9 +700,9 @@ def check_and_trade(symbol, row, df):
         f"[SCAN] {symbol} | Price {last_close} | 21 EMA {round(ema_now, precision)} | "
         f"slope30m {round(ema_slope, precision)} ({slope_dir}) | "
         f"slope4H {slope_4h_str} | "
-        f"below_EMA {round(perc_below, 1)}% (need {MIN_BELOW_PERC}%) | "
+        f"4H_below_EMA {round(perc_below_4h, 1)}% (need {MIN_BELOW_PERC}%) | "
         f"dist {round(ema_distance_pct * 100, 2)}% | "
-        f"above_ema={price_above_ema} slope_ok={ema_slope_positive} consol={is_consolidating} near={price_near_ema}"
+        f"above_ema={price_above_ema} slope30m_ok={ema_slope_positive} consol4H={is_consolidating} near={price_near_ema}"
     )
 
     if not price_above_ema:
@@ -722,10 +710,6 @@ def check_and_trade(symbol, row, df):
 
     if not ema_slope_positive:
         print(f"[SKIP] {symbol} — 30m slope is negative/flat")
-        return
-
-    if not is_consolidating:
-        print(f"[SKIP] {symbol} — consolidation filter failed ({round(perc_below,1)}% below EMA, need {MIN_BELOW_PERC}%)")
         return
 
     if not price_near_ema:
@@ -736,22 +720,26 @@ def check_and_trade(symbol, row, df):
         f"[SIGNAL] {symbol} | all conditions met ✓ "
         f"| slope30m {round(ema_slope, precision)} ✓ "
         f"| slope4H {slope_4h_str} ✓ "
-        f"| {round(perc_below,1)}% bars below EMA ✓ "
+        f"| 4H_below_EMA {round(perc_below_4h, 1)}% ✓ "
         f"| dist {round(ema_distance_pct*100,2)}% ✓ "
         f"| Price {last_close} | EMA {round(ema_now, precision)} "
         f"| SL {round(last_close * (1 - SL_PCT), precision)}"
     )
 
     # =========================================================================
-    # GATE 3 — 4H LINEAR REGRESSION SLOPE FILTER
-    # The last 4 four-hour candle closes must form a positive linear regression
-    # slope (same formula as the 30-min slope). This ensures the higher
-    # timeframe trend is rising before we enter on the 30-min signal.
+    # GATE 3 — 4H SLOPE + 4H CONSOLIDATION FILTER
     # =========================================================================
     if not slope_4h_ok:
         print(
-            f"[SKIP] {symbol} — 4H linreg slope is negative/flat over last "
-            f"{LINREG_4H_LOOKBACK} candles (slope={slope_4h_str}) — higher timeframe not bullish, skipping"
+            f"[SKIP] {symbol} — 4H linreg slope negative/flat "
+            f"(slope={slope_4h_str}) — higher timeframe not bullish, skipping"
+        )
+        return
+
+    if not is_consolidating:
+        print(
+            f"[SKIP] {symbol} — 4H consolidation filter failed "
+            f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, need {MIN_BELOW_PERC}%)"
         )
         return
 
