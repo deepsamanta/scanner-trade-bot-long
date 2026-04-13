@@ -32,13 +32,21 @@ SL_PCT           = 0.055      # 5.5% fixed below entry
 LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
+# Before placing a long, verify that the 4H timeframe also shows bullish momentum.
+# We fetch the last N 4H candles and compute a linear regression slope on their
+# closes using the exact same formula as the 30-min slope. The slope must be
+# positive (upward-bending curve on 4H) — if not, the trade is skipped.
 LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
+# Before a valid long, price must have spent enough time BELOW the EMA
+# (dipped / consolidated under it). This confirms a proper retest, not a
+# mid-air entry on an already extended move.
 FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 50)
 MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
+# Even after the crossover, don't buy if price has already run too far above EMA.
 MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
@@ -158,23 +166,18 @@ def sign_request(body):
 
 
 # =====================================================
-# TELEGRAM NOTIFICATION — FIXED
+# TELEGRAM NOTIFICATION
 # =====================================================
 
 def send_telegram(message):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
+        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
             "chat_id":    TELEGRAM_CHAT_ID,
             "text":       message,
             "parse_mode": "HTML",
         }
-        response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)  # ← json= not data=
-        result = response.json()
-        if not result.get("ok"):
-            print(f"[TELEGRAM] API rejected message: {result}")
-        else:
-            print(f"[TELEGRAM] Message sent OK")
+        requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
     except Exception as e:
         print(f"[TELEGRAM] Failed to send message: {e}")
 
@@ -629,6 +632,7 @@ def check_and_trade(symbol, row, df):
     ema_now  = ema_values[-1]
 
     # ── Linear regression slope — Pine Script formula (newest first) ──────────
+    # Pass last LINREG_LOOKBACK EMA values in newest->oldest order
     ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
     ema_slope          = compute_linreg_slope(ema_window)
     ema_slope_positive = ema_slope > 0
@@ -781,7 +785,7 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
     f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Price > 21 EMA | 30m slope > 0 | dist <{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
+    f"📈 Entry     : <code>Price &gt; 21 EMA | 30m slope &gt; 0 | dist &lt;{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
