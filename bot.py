@@ -29,7 +29,7 @@ FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
 SL_PCT           = 0.055      # 5.5% fixed below entry
 
 # ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
+LINREG_LOOKBACK  = 7          # candles for slope curve (matches Pine _slopeLook = 7)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
 LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
@@ -40,13 +40,13 @@ MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
 MAX_BELOW_PERC   = 72         # max % — above this means downtrend, not consolidation
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
-MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
+MAX_EMA_DISTANCE_PCT = 0.035   # 3.5% max distance above EMA
 
 # ─── DAILY SLOPE FILTER ───────────────────────────────────────────────────────
 # Before placing a long, the Daily 21 EMA linear regression slope must also be
 # positive. This blocks entries during multi-week downtrends where 4H can briefly
 # look bullish (dead-cat bounces / fakeouts above EMA).
-LINREG_DAILY_LOOKBACK = 4     # number of Daily candles to use for the slope check
+LINREG_DAILY_LOOKBACK = 3     # number of Daily candles to use for the slope check
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = 900        # 15 minutes in seconds
@@ -289,7 +289,7 @@ def get_daily_slope(symbol):
 
         ema_daily_window = list(reversed(ema_daily[-LINREG_DAILY_LOOKBACK:]))
         slope_daily      = compute_linreg_slope(ema_daily_window)
-        slope_ok         = slope_daily > 0
+        slope_ok         = slope_daily > -0.0001
 
         return slope_ok, slope_daily
 
@@ -352,9 +352,16 @@ def get_4h_data(symbol):
         # Must be between MIN_BELOW_PERC and MAX_BELOW_PERC.
         # Too low  → coin never dipped/retested EMA (mid-air entry).
         # Too high → coin has been in a downtrend and any cross is a fakeout.
+
+
+        # bars_below_4h = sum(
+        #     1 for i in range(1, FILTER_LOOKBACK + 1)
+        #     if float(candles[-(i + 1)]["close"]) < float(ema_4h[-(i + 1)])
+        # ) 
+
         bars_below_4h = sum(
-            1 for i in range(1, FILTER_LOOKBACK + 1)
-            if float(candles[-(i + 1)]["close"]) < float(ema_4h[-(i + 1)])
+            1 for i in range(FILTER_LOOKBACK)
+            if float(candles[-(i+1)]["close"]) < float(ema_4h[-(i+1)])
         ) if len(candles) > FILTER_LOOKBACK + 1 else 0
         perc_below_4h    = (bars_below_4h / FILTER_LOOKBACK) * 100
         is_consolidating = MIN_BELOW_PERC <= perc_below_4h <= MAX_BELOW_PERC
