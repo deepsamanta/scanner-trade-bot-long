@@ -32,22 +32,21 @@ SL_PCT           = 0.055      # 5.5% fixed below entry
 LINREG_LOOKBACK  = 4          # candles for slope curve (matches Pine _slopeLook = 4)
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
-# Before placing a long, verify that the 4H timeframe also shows bullish momentum.
-# We fetch the last N 4H candles and compute a linear regression slope on their
-# closes using the exact same formula as the 30-min slope. The slope must be
-# positive (upward-bending curve on 4H) — if not, the trade is skipped.
 LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
-# Before a valid long, price must have spent enough time BELOW the EMA
-# (dipped / consolidated under it). This confirms a proper retest, not a
-# mid-air entry on an already extended move.
 FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 50)
 MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
+MAX_BELOW_PERC   = 72         # max % — above this means downtrend, not consolidation
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
-# Even after the crossover, don't buy if price has already run too far above EMA.
 MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
+
+# ─── DAILY SLOPE FILTER ───────────────────────────────────────────────────────
+# Before placing a long, the Daily 21 EMA linear regression slope must also be
+# positive. This blocks entries during multi-week downtrends where 4H can briefly
+# look bullish (dead-cat bounces / fakeouts above EMA).
+LINREG_DAILY_LOOKBACK = 4     # number of Daily candles to use for the slope check
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = 900        # 15 minutes in seconds
@@ -243,18 +242,75 @@ def compute_linreg_slope(values):
 
 
 # =====================================================
+# DAILY SLOPE FILTER — linear regression slope on Daily EMA
+# =====================================================
+
+def get_daily_slope(symbol):
+    """
+    Fetches Daily candles, computes the 21 EMA on them, then returns:
+      - slope_ok    : bool  — linreg slope on last LINREG_DAILY_LOOKBACK Daily
+                              EMA values is positive
+      - slope_daily : float — raw slope value (for logging)
+
+    A negative Daily slope means the coin is in a multi-week downtrend.
+    Any 4H bounce above the EMA in that context is likely a fakeout.
+
+    On error, returns fail-open defaults so the trade is not blocked.
+    """
+    try:
+        pair_api = fut_pair(symbol)
+        url      = "https://public.coindcx.com/market_data/candlesticks"
+        now      = int(time.time())
+
+        # Need: EMA_PERIOD candles to seed the EMA
+        #       + LINREG_DAILY_LOOKBACK candles for slope
+        #       + safety buffer
+        fetch_candles = EMA_PERIOD + LINREG_DAILY_LOOKBACK + 10
+        fetch_seconds = fetch_candles * 24 * 3600   # Daily candles
+
+        params = {
+            "pair":       pair_api,
+            "from":       now - fetch_seconds,
+            "to":         now,
+            "resolution": "1D",   # Daily candles
+            "pcode":      "f",
+        }
+
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+
+        min_required = EMA_PERIOD + LINREG_DAILY_LOOKBACK
+        if len(candles) < min_required:
+            print(f"[DAILY] {symbol} — not enough Daily candles ({len(candles)}, need {min_required}), skipping filter (allow trade)")
+            return True, None
+
+        closes_daily = [float(c["close"]) for c in candles]
+        ema_daily    = compute_ema(closes_daily, EMA_PERIOD)
+
+        ema_daily_window = list(reversed(ema_daily[-LINREG_DAILY_LOOKBACK:]))
+        slope_daily      = compute_linreg_slope(ema_daily_window)
+        slope_ok         = slope_daily > 0
+
+        return slope_ok, slope_daily
+
+    except Exception as e:
+        print(f"[DAILY] {symbol} — fetch error: {e} — skipping filter (allow trade)")
+        return True, None
+
+
+# =====================================================
 # 4H TREND FILTER — linear regression slope on closes
 # =====================================================
 
 def get_4h_data(symbol):
     """
     Fetches 4H candles, computes the 21 EMA on them, then returns:
-      - slope_ok       : bool   — linreg slope on last 4 EMA values is positive
-      - slope_4h       : float  — raw slope value (for logging)
-      - is_consolidating: bool  — >= MIN_BELOW_PERC% of last FILTER_LOOKBACK 4H
-                                  candles closed below the 4H EMA (same logic as
-                                  the old 30m consolidation filter, now on 4H)
-      - perc_below_4h  : float  — actual % below for logging
+      - slope_ok        : bool  — linreg slope on last 4 EMA values is positive
+      - slope_4h        : float — raw slope value (for logging)
+      - is_consolidating: bool  — between MIN_BELOW_PERC% and MAX_BELOW_PERC% of
+                                  last FILTER_LOOKBACK 4H candles closed below EMA.
+                                  Below MIN = not enough dip; above MAX = downtrend.
+      - perc_below_4h   : float — actual % below for logging
 
     All computed from the same single API call to avoid duplicate fetches.
     On error, returns fail-open defaults so the trade is not blocked.
@@ -264,10 +320,6 @@ def get_4h_data(symbol):
         url      = "https://public.coindcx.com/market_data/candlesticks"
         now      = int(time.time())
 
-        # Need: EMA_PERIOD candles to seed the EMA
-        #       + FILTER_LOOKBACK candles for consolidation check
-        #       + LINREG_4H_LOOKBACK candles for slope
-        #       + safety buffer
         fetch_candles = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK + 10
         fetch_seconds = fetch_candles * 4 * 3600
 
@@ -297,12 +349,15 @@ def get_4h_data(symbol):
         slope_ok      = slope_4h > 0
 
         # ── Consolidation: % of last FILTER_LOOKBACK 4H candles below 4H EMA ─
+        # Must be between MIN_BELOW_PERC and MAX_BELOW_PERC.
+        # Too low  → coin never dipped/retested EMA (mid-air entry).
+        # Too high → coin has been in a downtrend and any cross is a fakeout.
         bars_below_4h = sum(
             1 for i in range(1, FILTER_LOOKBACK + 1)
             if float(candles[-(i + 1)]["close"]) < float(ema_4h[-(i + 1)])
         ) if len(candles) > FILTER_LOOKBACK + 1 else 0
-        perc_below_4h   = (bars_below_4h / FILTER_LOOKBACK) * 100
-        is_consolidating = perc_below_4h >= MIN_BELOW_PERC
+        perc_below_4h    = (bars_below_4h / FILTER_LOOKBACK) * 100
+        is_consolidating = MIN_BELOW_PERC <= perc_below_4h <= MAX_BELOW_PERC
 
         return slope_ok, slope_4h, is_consolidating, perc_below_4h
 
@@ -632,7 +687,6 @@ def check_and_trade(symbol, row, df):
     ema_now  = ema_values[-1]
 
     # ── Linear regression slope — Pine Script formula (newest first) ──────────
-    # Pass last LINREG_LOOKBACK EMA values in newest->oldest order
     ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
     ema_slope          = compute_linreg_slope(ema_window)
     ema_slope_positive = ema_slope > 0
@@ -696,13 +750,22 @@ def check_and_trade(symbol, row, df):
         if slope_4h_val is not None else "N/A"
     )
 
+    # ── Fetch Daily slope ────────────────────────────────────────────────────
+    slope_daily_ok, slope_daily_val = get_daily_slope(symbol)
+    slope_daily_str = (
+        f"{round(slope_daily_val, 6)} ({'✅' if slope_daily_ok else '❌'})"
+        if slope_daily_val is not None else "N/A"
+    )
+
     print(
         f"[SCAN] {symbol} | Price {last_close} | 21 EMA {round(ema_now, precision)} | "
         f"slope30m {round(ema_slope, precision)} ({slope_dir}) | "
         f"slope4H {slope_4h_str} | "
-        f"4H_below_EMA {round(perc_below_4h, 1)}% (need {MIN_BELOW_PERC}%) | "
+        f"slopeDaily {slope_daily_str} | "
+        f"4H_below_EMA {round(perc_below_4h, 1)}% (need {MIN_BELOW_PERC}%–{MAX_BELOW_PERC}%) | "
         f"dist {round(ema_distance_pct * 100, 2)}% | "
-        f"above_ema={price_above_ema} slope30m_ok={ema_slope_positive} consol4H={is_consolidating} near={price_near_ema}"
+        f"above_ema={price_above_ema} slope30m_ok={ema_slope_positive} "
+        f"consol4H={is_consolidating} slopeDaily_ok={slope_daily_ok} near={price_near_ema}"
     )
 
     if not price_above_ema:
@@ -727,9 +790,25 @@ def check_and_trade(symbol, row, df):
         return
 
     if not is_consolidating:
+        if perc_below_4h < MIN_BELOW_PERC:
+            print(
+                f"[SKIP] {symbol} — 4H consolidation filter failed "
+                f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, need ≥{MIN_BELOW_PERC}%)"
+            )
+        else:
+            print(
+                f"[SKIP] {symbol} — 4H downtrend filter triggered "
+                f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, max allowed {MAX_BELOW_PERC}% — likely downtrend fakeout)"
+            )
+        return
+
+    # =========================================================================
+    # GATE 4 — DAILY SLOPE FILTER
+    # =========================================================================
+    if not slope_daily_ok:
         print(
-            f"[SKIP] {symbol} — 4H consolidation filter failed "
-            f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, need {MIN_BELOW_PERC}%)"
+            f"[SKIP] {symbol} — Daily linreg slope negative/flat "
+            f"(slope={slope_daily_str}) — multi-week downtrend, fakeout risk too high, skipping"
         )
         return
 
@@ -737,6 +816,7 @@ def check_and_trade(symbol, row, df):
         f"[SIGNAL] {symbol} | all conditions met ✓ "
         f"| slope30m {round(ema_slope, precision)} ✓ "
         f"| slope4H {slope_4h_str} ✓ "
+        f"| slopeDaily {slope_daily_str} ✓ "
         f"| 4H_below_EMA {round(perc_below_4h, 1)}% ✓ "
         f"| dist {round(ema_distance_pct*100,2)}% ✓ "
         f"| Price {last_close} | EMA {round(ema_now, precision)} "
@@ -787,7 +867,8 @@ send_telegram(
     f"⏱ Timeframe  : <code>30 Min</code>\n"
     f"📈 Entry     : <code>Price &gt; 21 EMA | 30m slope &gt; 0 | dist &lt;{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
-    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
+    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}%–{MAX_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
+    f"📅 Daily Filter : <code>LinReg slope on last {LINREG_DAILY_LOOKBACK} × Daily EMA values > 0</code>\n"
     f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
