@@ -18,12 +18,8 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD       = 21
 MIN_RR           = 0.05
 
-# ─── DYNAMIC TP SETTINGS ──────────────────────────────────────────────────────
-SWING_LOOKBACK     = 3        # candles each side to confirm a swing high
-RESISTANCE_CANDLES = 200      # how many candles to scan for swing body highs
-MIN_TP_PCT         = 0.012    # minimum TP: 1.2% above entry
-MAX_TP_PCT         = 0.05     # maximum TP: 5% above entry (cap)
-FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no resistance found: 1%
+# ─── FIXED TP SETTING ─────────────────────────────────────────────────────────
+FIXED_TP_PCT     = 0.01       # fixed TP: 1% above entry
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
 SL_PCT           = 0.055      # 5.5% fixed below entry
@@ -35,7 +31,7 @@ LINREG_LOOKBACK  = 7          # candles for slope curve (matches Pine _slopeLook
 LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
-FILTER_LOOKBACK  = 150         # how many candles to check (Pine _filterLook = 50)
+FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 50)
 MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
 MAX_BELOW_PERC   = 75         # max % — above this means downtrend, not consolidation
 
@@ -367,53 +363,6 @@ def get_4h_data(symbol):
 
 
 # =====================================================
-# DYNAMIC TP — NEAREST RESISTANCE (SWING HIGH BODY)
-# =====================================================
-
-def find_nearest_resistance(candles, entry_price, precision):
-    """
-    Scans the last RESISTANCE_CANDLES candles for swing highs based on
-    candle BODY TOPS — max(open, close) — ignoring wicks.
-
-    A swing body high = candle whose body top is greater than SWING_LOOKBACK
-    candles on both its left and right side.
-
-    Returns the nearest (lowest) body-based swing high above entry, capped
-    between MIN_TP_PCT and MAX_TP_PCT. Falls back to FALLBACK_TP_PCT (1%)
-    if none found.
-    """
-    recent_candles = candles[-RESISTANCE_CANDLES:]
-    body_tops = [max(float(c["open"]), float(c["close"])) for c in recent_candles]
-    n  = len(body_tops)
-    lb = SWING_LOOKBACK
-
-    swing_body_highs = []
-
-    for i in range(lb, n - lb):
-        current = body_tops[i]
-        left    = body_tops[i - lb : i]
-        right   = body_tops[i + 1 : i + lb + 1]
-
-        if all(current > b for b in left) and all(current > b for b in right):
-            swing_body_highs.append(current)
-
-    min_tp_price = entry_price * (1 + MIN_TP_PCT)
-    max_tp_price = entry_price * (1 + MAX_TP_PCT)
-
-    valid = [b for b in swing_body_highs if min_tp_price <= b <= max_tp_price]
-
-    if valid:
-        nearest = min(valid)
-        tp      = round(nearest, precision)
-        print(f"[BODY RESISTANCE TP] Found swing body high at {tp} (from {len(valid)} candidates)")
-        return tp, "body_resistance"
-
-    fallback_tp = round(entry_price * (1 + FALLBACK_TP_PCT), precision)
-    print(f"[BODY RESISTANCE TP] No valid swing body high found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
-    return fallback_tp, "fallback"
-
-
-# =====================================================
 # OPEN POSITIONS
 # =====================================================
 
@@ -556,14 +505,16 @@ def compute_qty(entry_price, symbol):
 
 
 # =====================================================
-# PLACE LONG ORDER — with dynamic TP
+# PLACE LONG ORDER — with fixed 1% TP
 # =====================================================
 
 def place_long_order(symbol, entry_price, precision, candles):
     entry   = round(entry_price, precision)
     sl_base = round(entry * (1 - SL_PCT), precision)
 
-    tp, tp_type = find_nearest_resistance(candles, entry, precision)
+    # ── Fixed 1% TP ───────────────────────────────────────────────────────────
+    tp      = round(entry * (1 + FIXED_TP_PCT), precision)
+    tp_type = "fixed_1pct"
 
     reward = tp - entry
     risk   = entry - sl_base
@@ -869,7 +820,7 @@ send_telegram(
     f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
     f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}%–{MAX_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
     f"📅 Daily Filter : <code>LinReg slope on last {LINREG_DAILY_LOOKBACK} × Daily EMA values > 0</code>\n"
-    f"🎯 TP        : <code>Dynamic — nearest swing body resistance (1.5%–8%) | fallback 1%</code>\n"
+    f"🎯 TP        : <code>Fixed 1% above entry</code>\n"
     f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 15 minutes..."
