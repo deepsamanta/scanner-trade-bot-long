@@ -4,6 +4,7 @@ import time
 import hmac
 import hashlib
 import json
+import os
 import gspread
 
 from decimal import Decimal, getcontext
@@ -14,46 +15,56 @@ from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID
 getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
-# ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_PERIOD       = 21
-MIN_RR           = 0.05
+# =============================================================================
+# STRATEGY PARAMETERS  (port of Pine Script "200 EMA Dual-Path Strategy")
+# =============================================================================
 
-# ─── FIXED TP SETTING ─────────────────────────────────────────────────────────
-FIXED_TP_PCT     = 0.01       # fixed TP: 1% above entry
+# ─── CORE ─────────────────────────────────────────────────────────────────────
+EMA_PERIOD           = 200
+LOOKBACK             = 200      # candles to count below EMA
+BELOW_PCT_MIN        = 55.0     # min % of last LOOKBACK candles below EMA
+TP_PCT               = 2.5      # Take Profit % (fixed above entry)
+SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
 
-# ─── STOP LOSS ────────────────────────────────────────────────────────────────
-SL_PCT           = 0.055      # 5.5% fixed below entry
+# ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
+MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
+PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 
-# ─── LINEAR REGRESSION SLOPE ──────────────────────────────────────────────────
-LINREG_LOOKBACK  = 7          # candles for slope curve (matches Pine _slopeLook = 4)
+# ─── SLOPE FILTER ────────────────────────────────────────────────────────────
+USE_SLOPE_FILTER     = True
+SLOPE_BARS           = 10       # % change of EMA over this many bars
+MIN_EMA_SLOPE_PCT    = 0.1      # min EMA slope % to qualify
 
-# ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
-LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
+# ─── VOLUME FILTER ───────────────────────────────────────────────────────────
+USE_VOLUME_FILTER    = True
+VOL_LOOKBACK         = 20
+VOL_MULTIPLIER       = 1.0      # for reversal path
+BREAKOUT_VOL_MULT    = 1.3      # for breakout path
 
-# ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
-FILTER_LOOKBACK  = 50         # how many candles to check (Pine _filterLook = 50)
-MIN_BELOW_PERC   = 45         # min % of those candles that must be below EMA
-MAX_BELOW_PERC   = 75         # max % — above this means downtrend, not consolidation
+# ─── PATH B: MOMENTUM BREAKOUT ───────────────────────────────────────────────
+USE_BREAKOUT_PATH    = True
+MOMENTUM_LOOKBACK    = 5        # close > close[N] bars ago
 
-# ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
-MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance above EMA
+# ─── TRAILING STOP ───────────────────────────────────────────────────────────
+USE_TRAILING         = True
+TRAIL_ACTIVATE_PCT   = 1.0      # activate trail after profit % reached
+TRAIL_DISTANCE_PCT   = 0.8      # trail distance %
 
-# ─── DAILY SLOPE FILTER ───────────────────────────────────────────────────────
-# Before placing a long, the Daily 21 EMA linear regression slope must also be
-# positive. This blocks entries during multi-week downtrends where 4H can briefly
-# look bullish (dead-cat bounces / fakeouts above EMA).
-LINREG_DAILY_LOOKBACK = 3     # number of Daily candles to use for the slope check
+# ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
+RESOLUTION           = "15"     # CoinDCX 15-minute candles
+CANDLE_SECONDS       = 15 * 60
+SCAN_INTERVAL        = 900      # 15 minutes in seconds
 
-# ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
-SCAN_INTERVAL    = 900        # 15 minutes in seconds
+# ─── REQUEST TIMEOUTS (seconds) ──────────────────────────────────────────────
+REQUEST_TIMEOUT      = 15
+TELEGRAM_TIMEOUT     = 10
 
-# ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
-REQUEST_TIMEOUT  = 15
-TELEGRAM_TIMEOUT = 10
-
-# ─── GSPREAD RE-AUTH INTERVAL ─────────────────────────────────────────────────
+# ─── GSPREAD RE-AUTH INTERVAL ────────────────────────────────────────────────
 GSHEET_REAUTH_INTERVAL = 45 * 60
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── LOCAL STATE FILE (trailing stop + wait-for-retest persistence) ──────────
+STATE_FILE           = "bot_state.json"
+# =============================================================================
 
 
 # =====================================================
@@ -127,6 +138,44 @@ def update_sheet_sl(row, value):
 
 
 # =====================================================
+# LOCAL STATE PERSISTENCE (wait-retest + trailing stop tracking)
+# =====================================================
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[STATE] Load error: {e} — starting fresh")
+            return {}
+    return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[STATE] Save error: {e}")
+
+
+def init_symbol_state():
+    return {
+        "waiting_retest":        False,
+        "wait_start_candle_ts":  None,    # ms timestamp of the candle when armed
+        "in_position":           False,
+        "entry_path":            None,    # "retest" or "breakout"
+        "entry_price":           None,
+        "tp_level":              None,
+        "initial_sl":            None,
+        "current_sl":            None,
+        "highest_since_entry":   None,
+        "trail_active":          False,
+    }
+
+
+# =====================================================
 # SYMBOL HELPERS
 # =====================================================
 
@@ -193,177 +242,50 @@ def get_precision(raw_candle_close):
 # =====================================================
 
 def compute_ema(closes, period):
+    """Returns EMA series aligned so ema_values[-1] pairs with closes[-1]."""
+    if len(closes) < period:
+        return []
     multiplier = 2 / (period + 1)
     ema        = sum(closes[:period]) / period
     values     = [ema]
     for price in closes[period:]:
         ema = (price - ema) * multiplier + ema
         values.append(ema)
-    return values
-
-
-def compute_linreg_slope(values):
-    """
-    Exact Python port of the Pine Script f_true_slope() function:
-
-        for i = 0 to len - 1
-            x = len - i        # x counts DOWN: len, len-1, ..., 1
-            y = src[i]         # src[0] = most recent bar
-        slope = (n·ΣXY - ΣX·ΣY) / (n·ΣX2 - (ΣX)^2)
-
-    'values' must be ordered newest -> oldest (index 0 = most recent).
-    Call as: compute_linreg_slope(list(reversed(ema_values[-N:])))
-
-    A positive slope means the EMA curve is genuinely bending upward.
-    """
-    n      = len(values)
-    sum_x  = 0.0
-    sum_y  = 0.0
-    sum_xy = 0.0
-    sum_x2 = 0.0
-
-    for i in range(n):
-        x       = n - i          # x: n, n-1, ..., 1  (matches Pine Script)
-        y       = values[i]      # values[0] = most recent
-        sum_x  += x
-        sum_y  += y
-        sum_xy += x * y
-        sum_x2 += x * x
-
-    denom = n * sum_x2 - sum_x ** 2
-    if denom == 0:
-        return 0.0
-
-    return (n * sum_xy - sum_x * sum_y) / denom
+    # Pad left so index alignment with closes is clean
+    pad = [None] * (len(closes) - len(values))
+    return pad + values
 
 
 # =====================================================
-# DAILY SLOPE FILTER — linear regression slope on Daily EMA
+# CANDLE FETCH (15-minute resolution)
 # =====================================================
 
-def get_daily_slope(symbol):
-    """
-    Fetches Daily candles, computes the 21 EMA on them, then returns:
-      - slope_ok    : bool  — linreg slope on last LINREG_DAILY_LOOKBACK Daily
-                              EMA values is positive
-      - slope_daily : float — raw slope value (for logging)
+def fetch_candles(symbol, num_candles_needed):
+    pair_api = fut_pair(symbol)
+    url      = "https://public.coindcx.com/market_data/candlesticks"
+    now      = int(time.time())
+    # +50 as safety buffer
+    fetch_seconds = (num_candles_needed + 50) * CANDLE_SECONDS
 
-    A negative Daily slope means the coin is in a multi-week downtrend.
-    Any 4H bounce above the EMA in that context is likely a fakeout.
-
-    On error, returns fail-open defaults so the trade is not blocked.
-    """
+    params = {
+        "pair":       pair_api,
+        "from":       now - fetch_seconds,
+        "to":         now,
+        "resolution": RESOLUTION,
+        "pcode":      "f",
+    }
     try:
-        pair_api = fut_pair(symbol)
-        url      = "https://public.coindcx.com/market_data/candlesticks"
-        now      = int(time.time())
-
-        # Need: EMA_PERIOD candles to seed the EMA
-        #       + LINREG_DAILY_LOOKBACK candles for slope
-        #       + safety buffer
-        fetch_candles = EMA_PERIOD + LINREG_DAILY_LOOKBACK + 10
-        fetch_seconds = fetch_candles * 24 * 3600   # Daily candles
-
-        params = {
-            "pair":       pair_api,
-            "from":       now - fetch_seconds,
-            "to":         now,
-            "resolution": "1D",   # Daily candles
-            "pcode":      "f",
-        }
-
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
-
-        min_required = EMA_PERIOD + LINREG_DAILY_LOOKBACK
-        if len(candles) < min_required:
-            print(f"[DAILY] {symbol} — not enough Daily candles ({len(candles)}, need {min_required}), skipping filter (allow trade)")
-            return True, None
-
-        closes_daily = [float(c["close"]) for c in candles]
-        ema_daily    = compute_ema(closes_daily, EMA_PERIOD)
-
-        ema_daily_window = list(reversed(ema_daily[-LINREG_DAILY_LOOKBACK:]))
-        slope_daily      = compute_linreg_slope(ema_daily_window)
-        slope_ok         = slope_daily > 0
-
-        return slope_ok, slope_daily
-
+        data     = response.json().get("data", [])
+        candles  = sorted(data, key=lambda x: x["time"])
+        return candles
     except Exception as e:
-        print(f"[DAILY] {symbol} — fetch error: {e} — skipping filter (allow trade)")
-        return True, None
+        print(f"[CANDLES] {symbol} fetch error: {e}")
+        return []
 
 
 # =====================================================
-# 4H TREND FILTER — linear regression slope on closes
-# =====================================================
-
-def get_4h_data(symbol):
-    """
-    Fetches 4H candles, computes the 21 EMA on them, then returns:
-      - slope_ok        : bool  — linreg slope on last 4 EMA values is positive
-      - slope_4h        : float — raw slope value (for logging)
-      - is_consolidating: bool  — between MIN_BELOW_PERC% and MAX_BELOW_PERC% of
-                                  last FILTER_LOOKBACK 4H candles closed below EMA.
-                                  Below MIN = not enough dip; above MAX = downtrend.
-      - perc_below_4h   : float — actual % below for logging
-
-    All computed from the same single API call to avoid duplicate fetches.
-    On error, returns fail-open defaults so the trade is not blocked.
-    """
-    try:
-        pair_api = fut_pair(symbol)
-        url      = "https://public.coindcx.com/market_data/candlesticks"
-        now      = int(time.time())
-
-        fetch_candles = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK + 10
-        fetch_seconds = fetch_candles * 4 * 3600
-
-        params = {
-            "pair":       pair_api,
-            "from":       now - fetch_seconds,
-            "to":         now,
-            "resolution": "240",   # 240 minutes = 4 hours
-            "pcode":      "f",
-        }
-
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
-
-        min_required = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK
-        if len(candles) < min_required:
-            print(f"[4H] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filters (allow trade)")
-            return True, None, True, 0.0
-
-        # ── 21 EMA on 4H closes ───────────────────────────────────────────────
-        closes_4h = [float(c["close"]) for c in candles]
-        ema_4h    = compute_ema(closes_4h, EMA_PERIOD)
-
-        # ── Linreg slope on last LINREG_4H_LOOKBACK 4H EMA values ────────────
-        ema_4h_window = list(reversed(ema_4h[-LINREG_4H_LOOKBACK:]))
-        slope_4h      = compute_linreg_slope(ema_4h_window)
-        slope_ok      = slope_4h > 0
-
-        # ── Consolidation: % of last FILTER_LOOKBACK 4H candles below 4H EMA ─
-        # Must be between MIN_BELOW_PERC and MAX_BELOW_PERC.
-        # Too low  → coin never dipped/retested EMA (mid-air entry).
-        # Too high → coin has been in a downtrend and any cross is a fakeout.
-        bars_below_4h = sum(
-            1 for i in range(FILTER_LOOKBACK)
-            if float(candles[-(i + 1)]["close"]) < float(ema_4h[-(i + 1)])
-        ) if len(candles) >= FILTER_LOOKBACK + 1 else 0
-        perc_below_4h    = (bars_below_4h / FILTER_LOOKBACK) * 100
-        is_consolidating = MIN_BELOW_PERC <= perc_below_4h <= MAX_BELOW_PERC
-
-        return slope_ok, slope_4h, is_consolidating, perc_below_4h
-
-    except Exception as e:
-        print(f"[4H] {symbol} — fetch error: {e} — skipping filters (allow trade)")
-        return True, None, True, 0.0
-
-
-# =====================================================
-# OPEN POSITIONS
+# POSITIONS & ORDERS
 # =====================================================
 
 def get_open_positions():
@@ -378,52 +300,32 @@ def get_open_positions():
         url      = BASE_URL + "/exchange/v1/derivatives/futures/positions"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         positions = response.json()
+        if not isinstance(positions, list):
+            return []
         return [p for p in positions if float(p.get("active_pos", 0)) != 0]
     except Exception as e:
         print("get_open_positions error:", e)
         return []
 
 
-def get_position_tp(symbol):
-    try:
-        positions = get_open_positions()
-        pair = fut_pair(symbol)
-        for pos in positions:
-            if pos.get("pair") == pair:
-                tp = pos.get("take_profit_trigger")
-                if tp:
-                    return float(tp)
-        return None
-    except Exception:
-        return None
+def get_position_by_pair(symbol):
+    positions = get_open_positions()
+    pair = fut_pair(symbol)
+    for p in positions:
+        if p.get("pair") == pair:
+            return p
+    return None
 
 
-def get_position_entry(symbol):
-    try:
-        positions = get_open_positions()
-        pair = fut_pair(symbol)
-        for pos in positions:
-            if pos.get("pair") == pair:
-                ep = pos.get("entry_price") or pos.get("avg_price")
-                if ep:
-                    return float(ep)
-        return None
-    except Exception:
-        return None
-
-
-# =====================================================
-# OPEN ORDER CHECK
-# =====================================================
-
-def has_open_order(symbol):
+def list_orders_by_pair(symbol, statuses):
+    """Returns orders for a pair filtered by status list (e.g. ["open","initial","partially_filled"])"""
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
             "page":                       1,
             "size":                       50,
             "margin_currency_short_name": "USDT",
-            "status":                     ["initial", "open", "partially_filled"],
+            "status":                     statuses,
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
@@ -431,42 +333,63 @@ def has_open_order(symbol):
         orders   = response.json()
 
         pair = fut_pair(symbol)
-        if isinstance(orders, list):
-            for o in orders:
-                if o.get("pair") == pair:
-                    return True
-        return False
+        if not isinstance(orders, list):
+            return []
+        return [o for o in orders if o.get("pair") == pair]
+    except Exception as e:
+        print(f"[ORDERS] {symbol} fetch error: {e}")
+        return []
 
+
+def has_open_order(symbol):
+    """Entry-type open order still on book (not TP/SL)."""
+    try:
+        orders = list_orders_by_pair(symbol, ["initial", "open", "partially_filled"])
+        return len(orders) > 0
     except Exception as e:
         print(f"has_open_order error ({symbol}):", e)
         return False
 
 
-# =====================================================
-# TP CHECK — recent high over last 15 minutes
-# =====================================================
+def get_stop_loss_orders(symbol):
+    """Untriggered stop_market / stop_limit orders attached to the position."""
+    orders = list_orders_by_pair(symbol, ["untriggered"])
+    return [o for o in orders if o.get("order_type") in ("stop_market", "stop_limit")]
 
-def get_recent_high(symbol):
-    """
-    Fetches 1-min candles over the last 15 minutes (matching SCAN_INTERVAL)
-    to check if price touched TP via a wick since the last cycle.
-    """
+
+def cancel_order(order_id):
     try:
-        pair_api = fut_pair(symbol)
-        url  = "https://public.coindcx.com/market_data/candlesticks"
-        now  = int(time.time())
-        params = {
-            "pair":       pair_api,
-            "from":       now - SCAN_INTERVAL,   # last 15 minutes
-            "to":         now,
-            "resolution": "1",
-            "pcode":      "f",
+        body = {
+            "timestamp": int(time.time() * 1000),
+            "id":        order_id,
         }
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = response.json()["data"]
-        highs    = [float(c["high"]) for c in candles]
-        return max(highs)
-    except Exception:
+        payload, headers = sign_request(body)
+        url      = BASE_URL + "/exchange/v1/derivatives/futures/orders/cancel"
+        response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+        result   = response.json()
+        return result.get("status") == 200 or result.get("code") == 200
+    except Exception as e:
+        print(f"[CANCEL] order {order_id} error: {e}")
+        return False
+
+
+def create_position_sl(position_id, new_sl_price, precision):
+    """Create a stop-loss order for the position via create_tpsl endpoint (SL only)."""
+    try:
+        body = {
+            "timestamp": int(time.time() * 1000),
+            "id":        position_id,
+            "stop_loss": {
+                "stop_price": str(round(new_sl_price, precision)),
+                "order_type": "stop_market",
+            },
+        }
+        payload, headers = sign_request(body)
+        url      = BASE_URL + "/exchange/v1/derivatives/futures/positions/create_tpsl"
+        response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+        return response.json()
+    except Exception as e:
+        print(f"[SL CREATE] position {position_id} error: {e}")
         return None
 
 
@@ -505,40 +428,22 @@ def compute_qty(entry_price, symbol):
 
 
 # =====================================================
-# PLACE LONG ORDER — with fixed 1% TP
+# PLACE LONG ORDER
 # =====================================================
 
-def place_long_order(symbol, entry_price, precision, candles):
-    entry   = round(entry_price, precision)
-    sl_base = round(entry * (1 - SL_PCT), precision)
-
-    # ── Fixed 1% TP ───────────────────────────────────────────────────────────
-    tp      = round(entry * (1 + FIXED_TP_PCT), precision)
-    tp_type = "fixed_1pct"
-
-    reward = tp - entry
-    risk   = entry - sl_base
-
-    if risk <= 0 or (reward / risk) < MIN_RR:
-        rr = round(reward / risk, 2) if risk > 0 else "inf"
-        print(f"[SKIP] {symbol} RR {rr} < {MIN_RR}")
-        send_telegram(
-            f"⚠️ <b>LONG SIGNAL SKIPPED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"❌ Reason  : <code>RR {rr} below minimum {MIN_RR}</code>\n"
-            f"📍 Entry   : <code>{entry}</code>\n"
-            f"🎯 TP      : <code>{tp}</code>  ({tp_type})\n"
-            f"🛑 SL      : <code>{sl_base}</code>  (below entry)"
-        )
-        return None, None
+def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_path):
+    entry = round(entry_price, precision)
+    tp    = round(tp_price,    precision)
+    sl    = round(sl_price,    precision)
 
     qty = compute_qty(entry_price, symbol)
 
-    tp_pct = round(((tp - entry) / entry) * 100, 2)
+    tp_pct_display = round(((tp - entry) / entry) * 100, 2) if entry else 0
+    sl_pct_display = round(((entry - sl) / entry) * 100, 2) if entry else 0
 
     print(
-        f"[LONG TRADE] {symbol} BUY | Entry {entry} | TP {tp} (+{tp_pct}% — {tp_type}) "
-        f"| SL {sl_base} (-{SL_PCT*100:.0f}%) | RR {round(reward / risk, 2)} | Qty {qty}"
+        f"[LONG TRADE] {symbol} BUY ({entry_path}) | Entry {entry} | "
+        f"TP {tp} (+{tp_pct_display}%) | SL {sl} (-{sl_pct_display}%) | Qty {qty}"
     )
 
     body = {
@@ -551,18 +456,22 @@ def place_long_order(symbol, entry_price, precision, candles):
             "total_quantity":    qty,
             "leverage":          LEVERAGE,
             "take_profit_price": tp,
-            "stop_loss_price":   sl_base,
+            "stop_loss_price":   sl,
         },
     }
 
     payload, headers = sign_request(body)
-    response = requests.post(
-        BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
-        data=payload,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
-    )
-    result = response.json()
+    try:
+        response = requests.post(
+            BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
+            data=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        result = response.json()
+    except Exception as e:
+        print(f"[ERROR] {symbol} order request failed: {e}")
+        return False
 
     print(f"[API] {symbol} response: {result}")
 
@@ -571,236 +480,354 @@ def place_long_order(symbol, entry_price, precision, candles):
         send_telegram(
             f"❌ <b>LONG ORDER REJECTED — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
+            f"🛤 Path    : <code>{entry_path}</code>\n"
             f"📍 Entry   : <code>{entry}</code>\n"
-            f"🎯 TP      : <code>{tp}</code>  ({tp_type})\n"
-            f"🛑 SL      : <code>{sl_base}</code>\n"
+            f"🎯 TP      : <code>{tp}</code>\n"
+            f"🛑 SL      : <code>{sl}</code>\n"
             f"⚠️ Response : <code>{str(result)[:200]}</code>"
         )
-        return None, None
-
-    try:
-        order        = result[0] if isinstance(result, list) else result["order"]
-        tp_confirmed = order.get("take_profit_price", tp)
-    except Exception:
-        tp_confirmed = tp
+        return False
 
     send_telegram(
-        f"🟢 <b>NEW LONG (BUY) — {symbol}</b>\n"
+        f"🟢 <b>NEW LONG ({entry_path.upper()}) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry   : <code>{entry}</code>\n"
-        f"🎯 TP      : <code>{tp}</code>  (+{tp_pct}% — {tp_type})\n"
-        f"🛑 SL      : <code>{sl_base}</code>  (-{int(SL_PCT * 100)}% below entry)\n"
-        f"📊 RR      : <code>{round(reward / risk, 2)}</code>\n"
+        f"🎯 TP      : <code>{tp}</code>  (+{tp_pct_display}%)\n"
+        f"🛑 SL      : <code>{sl}</code>  (-{sl_pct_display}%)\n"
         f"📦 Qty     : <code>{qty}</code>\n"
         f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
-
-    return tp_confirmed, sl_base
+    return True
 
 
 # =====================================================
-# MAIN LOGIC
+# TRAILING STOP — cancel existing SL orders, place new one
 # =====================================================
 
-def check_and_trade(symbol, row, df):
-
-    pair     = fut_pair(symbol)
-    pair_api = pair
-    url      = "https://public.coindcx.com/market_data/candlesticks"
-    now      = int(time.time())
-
-    params = {
-        "pair":       pair_api,
-        "from":       now - 360000,
-        "to":         now,
-        "resolution": "30",
-        "pcode":      "f",
-    }
-
+def update_trailing_sl_on_exchange(symbol, position, new_sl, precision):
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+        existing_sl_orders = get_stop_loss_orders(symbol)
+        for o in existing_sl_orders:
+            cancel_order(o["id"])
+            time.sleep(0.3)
+
+        position_id = position.get("id")
+        result = create_position_sl(position_id, new_sl, precision)
+        if not result:
+            return False
+
+        sl_info = result.get("stop_loss") if isinstance(result, dict) else None
+        if isinstance(sl_info, dict) and sl_info.get("success") is False:
+            print(f"[SL UPDATE] {symbol} create failed: {sl_info.get('error')}")
+            return False
+        return True
+
     except Exception as e:
-        print(f"[ERROR] {symbol} candle fetch failed: {e}")
+        print(f"[SL UPDATE] {symbol} error: {e}")
+        return False
+
+
+# =====================================================
+# MAIN PER-SYMBOL LOGIC
+# =====================================================
+
+def check_and_trade(symbol, row, df, all_state):
+    pair = fut_pair(symbol)
+
+    # ─── Fetch enough 15m candles ────────────────────────────────────────────
+    candles_needed = EMA_PERIOD + LOOKBACK + 30
+    candles = fetch_candles(symbol, candles_needed)
+
+    if len(candles) < EMA_PERIOD + LOOKBACK + 5:
+        print(f"[SKIP] {symbol} — insufficient candles ({len(candles)})")
         return
 
-    # Need enough candles for EMA + linreg lookback
-    if len(candles) < EMA_PERIOD + LINREG_LOOKBACK + 1:
-        return
+    precision = get_precision(candles[-1]["close"])
+    closes    = [float(c["close"])  for c in candles]
+    highs     = [float(c["high"])   for c in candles]
+    lows      = [float(c["low"])    for c in candles]
+    volumes   = [float(c.get("volume", 0)) for c in candles]
 
-    precision  = get_precision(candles[-1]["close"])
-    closes     = [float(c["close"]) for c in candles]
-    last_close = float(candles[-1]["close"])
+    last_close = closes[-1]
+    last_high  = highs[-1]
+    last_low   = lows[-1]
+    last_ts    = int(candles[-1]["time"])   # milliseconds
 
+    # ─── Indicators ──────────────────────────────────────────────────────────
     ema_values = compute_ema(closes, EMA_PERIOD)
-    del closes
+    # Validate we have EMA available at the bars we need
+    if ema_values[-1] is None or ema_values[-1 - SLOPE_BARS] is None \
+       or ema_values[-1 - LOOKBACK] is None:
+        print(f"[SKIP] {symbol} — EMA not ready deep enough")
+        return
 
-    ema_now  = ema_values[-1]
+    ema_now    = ema_values[-1]
+    ema_prev   = ema_values[-2]
+    close_prev = closes[-2]
 
-    # ── Linear regression slope — Pine Script formula (newest first) ──────────
-    ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
-    ema_slope          = compute_linreg_slope(ema_window)
-    ema_slope_positive = ema_slope > 0
-    slope_dir          = "positive" if ema_slope_positive else "negative"
+    # % below EMA over last LOOKBACK bars (including current)
+    below_count = 0
+    for i in range(LOOKBACK):
+        c = closes[-1 - i]
+        e = ema_values[-1 - i]
+        if e is None:
+            continue
+        if c < e:
+            below_count += 1
+    below_pct_actual = (below_count / LOOKBACK) * 100.0
+    trend_qualifies  = below_pct_actual >= BELOW_PCT_MIN
+
+    # EMA slope %
+    ema_slope_ref = ema_values[-1 - SLOPE_BARS]
+    ema_slope_pct = ((ema_now - ema_slope_ref) / ema_slope_ref * 100.0) if ema_slope_ref else 0
+    slope_ok      = (not USE_SLOPE_FILTER) or (ema_slope_pct >= MIN_EMA_SLOPE_PCT)
+
+    # Volume SMA + checks
+    vol_window = volumes[-VOL_LOOKBACK:]
+    vol_avg    = (sum(vol_window) / VOL_LOOKBACK) if len(vol_window) == VOL_LOOKBACK else 0
+    last_vol   = volumes[-1]
+    vol_ok          = (not USE_VOLUME_FILTER) or (vol_avg > 0 and last_vol > vol_avg * VOL_MULTIPLIER)
+    breakout_vol_ok = (vol_avg > 0) and (last_vol > vol_avg * BREAKOUT_VOL_MULT)
+
+    # Momentum (close > close N bars ago)
+    price_rising = closes[-1] > closes[-1 - MOMENTUM_LOOKBACK]
+
+    # Crossover: prev close <= prev ema AND current close > current ema
+    cross_up = (close_prev <= ema_prev) and (last_close > ema_now)
+
+    # Proximity zone
+    proximity_level = ema_now * (1 + PROXIMITY_PCT / 100)
+
+    # ─── Get/init per-symbol state ───────────────────────────────────────────
+    st = all_state.get(symbol)
+    if st is None:
+        st = init_symbol_state()
+        all_state[symbol] = st
 
     # =========================================================================
-    # GATE 1 — Open position check
+    # RECONCILE WITH EXCHANGE
     # =========================================================================
-    positions = get_open_positions()
-    for pos in positions:
-        if pos.get("pair") == pair:
-            print(f"[ACTIVE TRADE] {symbol} — position open on CoinDCX, skipping")
-            tp_live = get_position_tp(symbol)
-            if tp_live:
-                update_sheet_tp(row, tp_live)
-            return
+    position = get_position_by_pair(symbol)
 
-    # =========================================================================
-    # GATE 2 — Open order check
-    # =========================================================================
+    # --- Case A: We have an active position on the exchange -----------------
+    if position is not None:
+        # Rebuild state if missing (e.g. after bot restart)
+        if not st.get("in_position"):
+            entry_px = float(position.get("avg_price") or position.get("entry_price") or last_close)
+            st["in_position"]          = True
+            st["entry_path"]           = st.get("entry_path") or "unknown"
+            st["entry_price"]          = entry_px
+            st["tp_level"]             = round(entry_px * (1 + TP_PCT / 100), precision)
+            st["initial_sl"]           = round(ema_now  * (1 - SL_BELOW_EMA_PCT / 100), precision)
+            existing_sl_trigger        = position.get("stop_loss_trigger")
+            st["current_sl"]           = float(existing_sl_trigger) if existing_sl_trigger else st["initial_sl"]
+            st["highest_since_entry"]  = max(last_high, entry_px)
+            st["trail_active"]         = ((last_high - entry_px) / entry_px * 100) >= TRAIL_ACTIVATE_PCT
+            st["waiting_retest"]       = False
+            st["wait_start_candle_ts"] = None
+            print(f"[RECONCILE] {symbol} — reconstructed state from exchange position")
+
+        # ── Trailing-stop management ─────────────────────────────────────────
+        if USE_TRAILING and st["entry_price"]:
+            st["highest_since_entry"] = max(float(st["highest_since_entry"] or 0), last_high)
+
+            profit_pct = (st["highest_since_entry"] - st["entry_price"]) / st["entry_price"] * 100.0
+            if profit_pct >= TRAIL_ACTIVATE_PCT:
+                st["trail_active"] = True
+
+            if st["trail_active"]:
+                new_sl = round(st["highest_since_entry"] * (1 - TRAIL_DISTANCE_PCT / 100), precision)
+                old_sl = float(st.get("current_sl") or 0)
+
+                if new_sl > old_sl:
+                    print(
+                        f"[TRAIL] {symbol} — raising SL {old_sl} -> {new_sl} "
+                        f"(high {st['highest_since_entry']}, profit {round(profit_pct, 2)}%)"
+                    )
+                    ok = update_trailing_sl_on_exchange(symbol, position, new_sl, precision)
+                    if ok:
+                        st["current_sl"] = new_sl
+                        update_sheet_sl(row, new_sl)
+                        send_telegram(
+                            f"🔄 <b>TRAIL SL RAISED — {symbol}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📈 Highest  : <code>{round(st['highest_since_entry'], precision)}</code>\n"
+                            f"🛑 New SL   : <code>{new_sl}</code>\n"
+                            f"📊 Profit % : <code>{round(profit_pct, 2)}%</code>"
+                        )
+                    else:
+                        print(f"[TRAIL] {symbol} — SL update failed, will retry next scan")
+
+        save_state(all_state)
+        return
+
+    # --- Case B: Position just closed (state says in_position but exchange doesn't) ---
+    if st.get("in_position"):
+        print(f"[POSITION CLOSED] {symbol} — cleaning up state")
+        send_telegram(
+            f"✅ <b>POSITION CLOSED — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🛤 Path     : <code>{st.get('entry_path')}</code>\n"
+            f"📍 Entry    : <code>{st.get('entry_price')}</code>\n"
+            f"🎯 TP was   : <code>{st.get('tp_level')}</code>\n"
+            f"🛑 Last SL  : <code>{st.get('current_sl')}</code>"
+        )
+        all_state[symbol] = init_symbol_state()
+        st = all_state[symbol]
+        save_state(all_state)
+
+    # --- Skip if an entry limit order is still on the book ------------------
     if has_open_order(symbol):
-        print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
+        print(f"[OPEN ORDER] {symbol} — unfilled entry order on book, skipping")
         return
 
-    # ── TP monitoring ─────────────────────────────────────────────────────────
-    tp_raw = df.iloc[row, 1]
-
-    if str(tp_raw).strip().upper() == "TP COMPLETED":
-        print(f"[SKIP] {symbol} TP COMPLETED")
-        return
-
-    try:
-        tp_stored = float(tp_raw)
-
-        if last_close >= tp_stored:
-            update_sheet_tp(row, "TP COMPLETED")
-            print(f"[TP HIT] {symbol} price {last_close} >= TP {tp_stored}")
-            return
-
-        recent_high = get_recent_high(symbol)
-        if recent_high and recent_high >= tp_stored:
-            update_sheet_tp(row, "TP COMPLETED")
-            print(f"[TP HIT] {symbol} recent high {recent_high} >= TP {tp_stored}")
-            return
-
-    except Exception:
-        pass
-
     # =========================================================================
-    # STRATEGY CONDITIONS
+    # STRATEGY EVALUATION
     # =========================================================================
-
-    ema_distance_pct = (last_close - ema_now) / ema_now if ema_now > 0 else 0
-    price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
-    price_above_ema  = last_close > ema_now
-
-    # ── Fetch 4H data (slope + consolidation) — single API call ─────────────
-    slope_4h_ok, slope_4h_val, is_consolidating, perc_below_4h = get_4h_data(symbol)
-    slope_4h_str = (
-        f"{round(slope_4h_val, 6)} ({'✅' if slope_4h_ok else '❌'})"
-        if slope_4h_val is not None else "N/A"
-    )
-
-    # ── Fetch Daily slope ────────────────────────────────────────────────────
-    slope_daily_ok, slope_daily_val = get_daily_slope(symbol)
-    slope_daily_str = (
-        f"{round(slope_daily_val, 6)} ({'✅' if slope_daily_ok else '❌'})"
-        if slope_daily_val is not None else "N/A"
-    )
+    ema_distance_pct = ((last_close - ema_now) / ema_now * 100.0) if ema_now else 0
 
     print(
-        f"[SCAN] {symbol} | Price {last_close} | 21 EMA {round(ema_now, precision)} | "
-        f"slope30m {round(ema_slope, precision)} ({slope_dir}) | "
-        f"slope4H {slope_4h_str} | "
-        f"slopeDaily {slope_daily_str} | "
-        f"4H_below_EMA {round(perc_below_4h, 1)}% (need {MIN_BELOW_PERC}%–{MAX_BELOW_PERC}%) | "
-        f"dist {round(ema_distance_pct * 100, 2)}% | "
-        f"above_ema={price_above_ema} slope30m_ok={ema_slope_positive} "
-        f"consol4H={is_consolidating} slopeDaily_ok={slope_daily_ok} near={price_near_ema}"
-    )
-
-    if not price_above_ema:
-        return
-
-    if not ema_slope_positive:
-        print(f"[SKIP] {symbol} — 30m slope is negative/flat")
-        return
-
-    if not price_near_ema:
-        print(f"[SKIP] {symbol} — price {round(ema_distance_pct*100,2)}% above EMA, exceeds {MAX_EMA_DISTANCE_PCT*100}% max — waiting for retest")
-        return
-
-    # =========================================================================
-    # GATE 3 — 4H SLOPE + 4H CONSOLIDATION FILTER
-    # =========================================================================
-    if not slope_4h_ok:
-        print(
-            f"[SKIP] {symbol} — 4H linreg slope negative/flat "
-            f"(slope={slope_4h_str}) — higher timeframe not bullish, skipping"
-        )
-        return
-
-    if not is_consolidating:
-        if perc_below_4h < MIN_BELOW_PERC:
-            print(
-                f"[SKIP] {symbol} — 4H consolidation filter failed "
-                f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, need ≥{MIN_BELOW_PERC}%)"
-            )
-        else:
-            print(
-                f"[SKIP] {symbol} — 4H downtrend filter triggered "
-                f"({round(perc_below_4h, 1)}% of last {FILTER_LOOKBACK} 4H candles below EMA, max allowed {MAX_BELOW_PERC}% — likely downtrend fakeout)"
-            )
-        return
-
-    # =========================================================================
-    # GATE 4 — DAILY SLOPE FILTER
-    # =========================================================================
-    if not slope_daily_ok:
-        print(
-            f"[SKIP] {symbol} — Daily linreg slope negative/flat "
-            f"(slope={slope_daily_str}) — multi-week downtrend, fakeout risk too high, skipping"
-        )
-        return
-
-    print(
-        f"[SIGNAL] {symbol} | all conditions met ✓ "
-        f"| slope30m {round(ema_slope, precision)} ✓ "
-        f"| slope4H {slope_4h_str} ✓ "
-        f"| slopeDaily {slope_daily_str} ✓ "
-        f"| 4H_below_EMA {round(perc_below_4h, 1)}% ✓ "
-        f"| dist {round(ema_distance_pct*100,2)}% ✓ "
-        f"| Price {last_close} | EMA {round(ema_now, precision)} "
-        f"| SL {round(last_close * (1 - SL_PCT), precision)}"
+        f"[SCAN] {symbol} | close={last_close} ema200={round(ema_now, precision)} | "
+        f"below%={round(below_pct_actual, 1)} (need >={BELOW_PCT_MIN}) | "
+        f"slope%={round(ema_slope_pct, 3)} (need >={MIN_EMA_SLOPE_PCT}) | "
+        f"vol={round(last_vol, 2)} avg={round(vol_avg, 2)} | "
+        f"crossUp={cross_up} trendQ={trend_qualifies} slopeOK={slope_ok} "
+        f"volOK={vol_ok} waitingRetest={st['waiting_retest']}"
     )
 
     # =========================================================================
-    # FINAL GUARD — re-check everything right before placing
+    # WAITING RETEST STATE (Path A has already been armed)
     # =========================================================================
-    live_positions = get_open_positions()
-    for pos in live_positions:
-        if pos.get("pair") == pair:
-            print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
+    if st["waiting_retest"]:
+        wait_start = st.get("wait_start_candle_ts")
+        if wait_start is None:
+            st["waiting_retest"] = False
+            save_state(all_state)
             return
 
-    if has_open_order(symbol):
-        print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
+        bars_waiting = max(0, int((last_ts - wait_start) // (CANDLE_SECONDS * 1000)))
+
+        # Invalidated: close back below EMA after >= 1 bar
+        if bars_waiting >= 1 and last_close < ema_now:
+            print(f"[INVALIDATED] {symbol} — close {last_close} < EMA {round(ema_now, precision)}")
+            st["waiting_retest"]       = False
+            st["wait_start_candle_ts"] = None
+            save_state(all_state)
+            return
+
+        # Timed out
+        if bars_waiting > MAX_RETEST_BARS:
+            print(f"[TIMEOUT] {symbol} — {bars_waiting} bars > max {MAX_RETEST_BARS}, clearing wait")
+            st["waiting_retest"]       = False
+            st["wait_start_candle_ts"] = None
+            save_state(all_state)
+            return
+
+        # Retest confirmed: low dipped into proximity zone and close stayed above EMA
+        retest_confirmed = (bars_waiting >= 1
+                            and last_low <= proximity_level
+                            and last_close > ema_now)
+
+        if retest_confirmed:
+            print(f"[RETEST CONFIRMED] {symbol} — entering long (Path A)")
+
+            # Final guard
+            if get_position_by_pair(symbol) is not None:
+                print(f"[ABORT] {symbol} — position appeared just before placement")
+                return
+            if has_open_order(symbol):
+                print(f"[ABORT] {symbol} — order appeared just before placement")
+                return
+
+            entry_price = last_close
+            tp_price    = entry_price * (1 + TP_PCT / 100)
+            sl_price    = ema_now     * (1 - SL_BELOW_EMA_PCT / 100)
+
+            placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "retest")
+            if placed:
+                st["waiting_retest"]       = False
+                st["wait_start_candle_ts"] = None
+                st["in_position"]          = True
+                st["entry_path"]           = "retest"
+                st["entry_price"]          = round(entry_price, precision)
+                st["tp_level"]             = round(tp_price,    precision)
+                st["initial_sl"]           = round(sl_price,    precision)
+                st["current_sl"]           = round(sl_price,    precision)
+                st["highest_since_entry"]  = last_high
+                st["trail_active"]         = False
+                update_sheet_tp(row, st["tp_level"])
+                update_sheet_sl(row, st["current_sl"])
+
+            save_state(all_state)
+            return
+
+        # Still waiting
+        print(f"[WAIT] {symbol} — bars_waiting={bars_waiting}/{MAX_RETEST_BARS}")
+        save_state(all_state)
         return
 
-    if last_close <= ema_now:
-        print(
-            f"[SKIP] {symbol} — last close {last_close} not above "
-            f"21 EMA {round(ema_now, precision)} at placement, aborting"
+    # =========================================================================
+    # PATH A — ARM NEW REVERSAL SETUP
+    # =========================================================================
+    new_setup = trend_qualifies and cross_up and slope_ok and vol_ok
+    if new_setup:
+        print(f"[SETUP ARMED] {symbol} — trendQ ✓ crossUp ✓ slope ✓ vol ✓ → waiting retest")
+        st["waiting_retest"]       = True
+        st["wait_start_candle_ts"] = last_ts
+        send_telegram(
+            f"🟡 <b>REVERSAL SETUP ARMED — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Close     : <code>{last_close}</code>\n"
+            f"📊 EMA200    : <code>{round(ema_now, precision)}</code>\n"
+            f"📉 Below %   : <code>{round(below_pct_actual, 1)}%</code>\n"
+            f"📈 Slope %   : <code>{round(ema_slope_pct, 3)}%</code>\n"
+            f"📦 Vol ratio : <code>{round(last_vol / vol_avg, 2) if vol_avg else 0}x</code>\n"
+            f"🎯 Proximity : <code>{round(proximity_level, precision)}</code>\n"
+            f"⌛ Waiting up to {MAX_RETEST_BARS} × 15m candles for retest"
         )
+        save_state(all_state)
         return
 
-    tp_confirmed, sl_placed = place_long_order(
-        symbol, last_close, precision, candles
-    )
-    if tp_confirmed:
-        update_sheet_tp(row, tp_confirmed)
-    if sl_placed:
-        update_sheet_sl(row, sl_placed)
+    # =========================================================================
+    # PATH B — MOMENTUM BREAKOUT (when trend does NOT qualify)
+    # =========================================================================
+    if USE_BREAKOUT_PATH:
+        breakout_entry = (not trend_qualifies) and cross_up and price_rising and breakout_vol_ok
+        if breakout_entry:
+            print(f"[BREAKOUT] {symbol} — entering long (Path B)")
+
+            # Final guard
+            if get_position_by_pair(symbol) is not None:
+                print(f"[ABORT] {symbol} — position appeared just before placement")
+                return
+            if has_open_order(symbol):
+                print(f"[ABORT] {symbol} — order appeared just before placement")
+                return
+
+            entry_price = last_close
+            tp_price    = entry_price * (1 + TP_PCT / 100)
+            sl_price    = ema_now     * (1 - SL_BELOW_EMA_PCT / 100)
+
+            placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "breakout")
+            if placed:
+                st["waiting_retest"]       = False
+                st["wait_start_candle_ts"] = None
+                st["in_position"]          = True
+                st["entry_path"]           = "breakout"
+                st["entry_price"]          = round(entry_price, precision)
+                st["tp_level"]             = round(tp_price,    precision)
+                st["initial_sl"]           = round(sl_price,    precision)
+                st["current_sl"]           = round(sl_price,    precision)
+                st["highest_since_entry"]  = last_high
+                st["trail_active"]         = False
+                update_sheet_tp(row, st["tp_level"])
+                update_sheet_sl(row, st["current_sl"])
+
+            save_state(all_state)
+            return
+
+    # No action
+    save_state(all_state)
 
 
 # =====================================================
@@ -814,15 +841,14 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy  : <code>21 EMA Breakout Long</code>\n"
-    f"⏱ Timeframe  : <code>30 Min</code>\n"
-    f"📈 Entry     : <code>Price &gt; 21 EMA | 30m slope &gt; 0 | dist &lt;{int(MAX_EMA_DISTANCE_PCT*100)}%</code>\n"
-    f"✅ Filter    : <code>Dipped coins added manually to sheet</code>\n"
-    f"📊 4H Filter : <code>LinReg slope on last {LINREG_4H_LOOKBACK} × 4H EMA values > 0 | {MIN_BELOW_PERC}%–{MAX_BELOW_PERC}% of last {FILTER_LOOKBACK} 4H candles below 4H EMA</code>\n"
-    f"📅 Daily Filter : <code>LinReg slope on last {LINREG_DAILY_LOOKBACK} × Daily EMA values > 0</code>\n"
-    f"🎯 TP        : <code>Fixed 1% above entry</code>\n"
-    f"🛑 SL        : <code>{int(SL_PCT * 100)}% fixed below entry</code>\n"
-    f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+    f"📐 Strategy   : <code>200 EMA Dual-Path (Reversal + Breakout)</code>\n"
+    f"⏱ Timeframe  : <code>15 Min</code>\n"
+    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + crossUp + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
+    f"🅱️ Path B    : <code>crossUp + close>close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} when NOT qualifying</code>\n"
+    f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
+    f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%)</code>\n"
+    f"🪜 Trail      : <code>Activate at {TRAIL_ACTIVATE_PCT}% profit, distance {TRAIL_DISTANCE_PCT}%</code>\n"
+    f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 15 minutes..."
 )
 
@@ -835,6 +861,7 @@ while True:
             time.sleep(SCAN_INTERVAL)
             continue
 
+        state  = load_state()
         cycle += 1
         consecutive_errors = 0
 
@@ -845,8 +872,13 @@ while True:
             if not pair:
                 continue
             symbol = normalize_symbol(pair)
-            check_and_trade(symbol, row, df)
+            try:
+                check_and_trade(symbol, row, df, state)
+            except Exception as e:
+                print(f"[ERROR] {symbol} check_and_trade failed: {e}")
+                continue
 
+        save_state(state)
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
