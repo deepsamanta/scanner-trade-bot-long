@@ -22,8 +22,8 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 200      # candles to count below EMA
-BELOW_PCT_MIN        = 55.0     # min % of last LOOKBACK candles below EMA
+LOOKBACK             = 250      # candles to count below EMA
+BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
 
@@ -32,11 +32,12 @@ MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
 PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 
 # ─── SLOPE FILTER ────────────────────────────────────────────────────────────
-# Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = 0.05
+# Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = -0.2
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
-SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = 0.05     # min EMA slope % to qualify  (Pine default: 0.05)
+SLOPE_BARS           = 5       # % change of EMA over this many bars
+MIN_EMA_SLOPE_PCT    = 0.05     # min EMA slope % to qualify  (Pine default: -0.2)
+
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
 VOL_LOOKBACK         = 20
@@ -46,6 +47,17 @@ BREAKOUT_VOL_MULT    = 1.3      # breakout path (Path B)
 # ─── PATH B: MOMENTUM BREAKOUT ───────────────────────────────────────────────
 USE_BREAKOUT_PATH    = True
 MOMENTUM_LOOKBACK    = 5        # close > close[N] bars ago
+
+# ─── CROSSOVER LOOKBACK (rescue filter) ──────────────────────────────────────
+# Pine strict: crossover must fire on the CURRENT bar.
+# Problem: if any other filter (slope/volume) happens to fail on the exact bar
+# the cross fires, the whole setup is discarded — even if it would have passed
+# on the very next bar. This causes many viable signals to be missed.
+# Fix: accept a cross that happened within the last N bars, PROVIDED price is
+# still above EMA and not overextended. All other filters (trend, slope, vol)
+# must still pass on the CURRENT bar, exactly as before.
+CROSS_LOOKBACK        = 5        # accept crossover from last N bars (incl. current)
+MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (anti-chase)
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION           = "15"     # CoinDCX 15-minute candles
@@ -250,6 +262,37 @@ def compute_ema(closes, period):
         values.append(ema)
     pad = [None] * (len(closes) - len(values))
     return pad + values
+
+
+def had_recent_crossup(closes, emas, lookback):
+    """
+    Returns (found, bars_ago) where found=True if a close crossed above EMA
+    at any point within the last `lookback` bars (inclusive of current bar).
+    bars_ago = 0 means cross on current bar, 1 means previous bar, etc.
+
+    A cross is defined as: closes[i-1] <= emas[i-1] AND closes[i] > emas[i]
+
+    Used by the rescue filter so a crossover that happened a few bars ago
+    isn't forgotten just because slope/volume failed on that exact bar.
+    """
+    # Need at least one prior bar to compare against
+    n = len(closes)
+    if n < 2 or lookback < 1:
+        return False, None
+
+    # Walk backwards from the current bar (i=-1) up to lookback bars back
+    for k in range(lookback):
+        i_now  = n - 1 - k        # current index within lookback
+        i_prev = i_now - 1
+        if i_prev < 0:
+            break
+        c_now,  c_prev = closes[i_now], closes[i_prev]
+        e_now,  e_prev = emas[i_now],   emas[i_prev]
+        if e_now is None or e_prev is None:
+            continue
+        if c_prev <= e_prev and c_now > e_now:
+            return True, k
+    return False, None
 
 
 # =====================================================
@@ -510,8 +553,29 @@ def check_and_trade(symbol, row, df, all_state):
     # Momentum (close > close N bars ago) — Path B only
     price_rising = closes[-1] > closes[-1 - MOMENTUM_LOOKBACK]
 
-    # Crossover — prev close <= prev ema AND current close > current ema  (Pine's ta.crossover)
-    cross_up = (close_prev <= ema_prev) and (last_close > ema_now)
+    # ─── Crossover detection ─────────────────────────────────────────────────
+    # STRICT (Pine-exact): cross on the current bar only.
+    cross_up_strict = (close_prev <= ema_prev) and (last_close > ema_now)
+
+    # RESCUE: a cross within the last CROSS_LOOKBACK bars (inclusive of current).
+    # This exists so a viable signal isn't thrown away when slope/volume happen
+    # to fail on the exact bar the cross fires. All other filters still need to
+    # pass on the current bar — we only relax *when* the cross occurred.
+    cross_up_recent, cross_bars_ago = had_recent_crossup(closes, ema_values, CROSS_LOOKBACK)
+
+    # Anti-chase guard: don't arm if price has already run far above EMA.
+    # Without this, a recent-cross rescue could fire on a bar where price is
+    # already overextended and there's no meaningful room left to the TP.
+    ema_distance_pct  = ((last_close - ema_now) / ema_now * 100.0) if ema_now else 0
+    not_overextended  = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
+    price_above_ema   = last_close > ema_now
+
+    # Final cross gate used by both paths:
+    #   - strict fires alone (Pine behavior), OR
+    #   - recent cross + price still above EMA + not overextended
+    cross_valid = cross_up_strict or (
+        cross_up_recent and price_above_ema and not_overextended
+    )
 
     # Proximity zone for retest
     proximity_level = ema_now * (1 + PROXIMITY_PCT / 100)
@@ -569,13 +633,23 @@ def check_and_trade(symbol, row, df, all_state):
     # =========================================================================
     vol_ratio = round(last_vol / vol_avg, 2) if vol_avg else 0
 
+    # Describe the cross state for logs
+    if cross_up_strict:
+        cross_log = "strict(now)"
+    elif cross_up_recent:
+        cross_log = f"recent({cross_bars_ago}b ago)"
+    else:
+        cross_log = "none"
+
     print(
         f"[SCAN] {symbol} | close={last_close} ema200={round(ema_now, precision)} | "
         f"below%={round(below_pct_actual, 1)} (need >={BELOW_PCT_MIN}) | "
         f"slope%={round(ema_slope_pct, 3)} (need >={MIN_EMA_SLOPE_PCT}) | "
         f"vol={round(last_vol, 2)} avg={round(vol_avg, 2)} ratio={vol_ratio}x | "
-        f"crossUp={cross_up} trendQ={trend_qualifies} slopeOK={slope_ok} "
-        f"volOK={vol_ok} priceRising={price_rising} waitingRetest={st['waiting_retest']}"
+        f"cross={cross_log} crossValid={cross_valid} | "
+        f"distEMA={round(ema_distance_pct, 2)}% (max {MAX_EMA_DISTANCE_PCT}%) notOver={not_overextended} | "
+        f"trendQ={trend_qualifies} slopeOK={slope_ok} volOK={vol_ok} "
+        f"priceRising={price_rising} waitingRetest={st['waiting_retest']}"
     )
 
     # =========================================================================
@@ -647,17 +721,27 @@ def check_and_trade(symbol, row, df, all_state):
 
     # =========================================================================
     # PATH A — ARM NEW REVERSAL SETUP
-    # Pine: newSetup = trendQualifies and crossUp and slopeOK and volOK
-    #               and strategy.position_size == 0 and not waitingRetest
+    # Pine reference:
+    #   newSetup = trendQualifies and crossUp and slopeOK and volOK
+    #            and strategy.position_size == 0 and not waitingRetest
+    #
+    # Adapted: `cross_up` is replaced with `cross_valid` so a cross that
+    # happened up to CROSS_LOOKBACK bars ago can still arm the setup, provided
+    # price is still above EMA and not overextended. All other filters still
+    # evaluate on the CURRENT bar, unchanged from Pine.
     # =========================================================================
     new_setup = (trend_qualifies
-                 and cross_up
+                 and cross_valid
                  and slope_ok
                  and vol_ok
                  and not st["waiting_retest"])
 
     if new_setup:
-        print(f"[SETUP ARMED] {symbol} — trendQ ✓ crossUp ✓ slope ✓ vol ✓ → waiting retest")
+        cross_detail = "strict" if cross_up_strict else f"rescued ({cross_bars_ago}b ago)"
+        print(
+            f"[SETUP ARMED] {symbol} — trendQ ✓ cross:{cross_detail} ✓ "
+            f"slope ✓ vol ✓ → waiting retest"
+        )
         st["waiting_retest"]       = True
         st["wait_start_candle_ts"] = last_ts
         send_telegram(
@@ -668,6 +752,8 @@ def check_and_trade(symbol, row, df, all_state):
             f"📉 Below %   : <code>{round(below_pct_actual, 1)}%</code>\n"
             f"📈 Slope %   : <code>{round(ema_slope_pct, 3)}%</code>\n"
             f"📦 Vol ratio : <code>{vol_ratio}x</code>\n"
+            f"🔀 Cross     : <code>{cross_detail}</code>\n"
+            f"📏 Dist EMA  : <code>{round(ema_distance_pct, 2)}%</code>\n"
             f"🎯 Proximity : <code>{round(proximity_level, precision)}</code>\n"
             f"⌛ Waiting up to {MAX_RETEST_BARS} × 15m candles for retest"
         )
@@ -676,16 +762,22 @@ def check_and_trade(symbol, row, df, all_state):
 
     # =========================================================================
     # PATH B — MOMENTUM BREAKOUT  (fires when trend does NOT qualify)
-    # Pine: breakoutEntry = useBreakoutPath and not trendQualifies and crossUp
-    #                    and priceRising and breakoutVolOK and strategy.position_size == 0
+    # Pine reference:
+    #   breakoutEntry = useBreakoutPath and not trendQualifies and crossUp
+    #                 and priceRising and breakoutVolOK and strategy.position_size == 0
+    #
+    # Adapted: same rescue-window treatment for the cross as Path A.
+    # `cross_valid` already enforces price_above_ema and not_overextended
+    # when the cross is rescued, so we don't re-check those here.
     # =========================================================================
     if USE_BREAKOUT_PATH:
         breakout_entry = ((not trend_qualifies)
-                          and cross_up
+                          and cross_valid
                           and price_rising
                           and breakout_vol_ok)
         if breakout_entry:
-            print(f"[BREAKOUT] {symbol} — entering long (Path B)")
+            cross_detail = "strict" if cross_up_strict else f"rescued ({cross_bars_ago}b ago)"
+            print(f"[BREAKOUT] {symbol} — entering long (Path B, cross:{cross_detail})")
 
             # Final guard
             if get_position_by_pair(symbol) is not None:
@@ -731,8 +823,9 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy   : <code>200 EMA Dual-Path (Reversal + Breakout)</code>\n"
     f"⏱ Timeframe  : <code>15 Min</code>\n"
-    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + crossUp + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
-    f"🅱️ Path B    : <code>crossUp + close>close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} when trend NOT qualifying</code>\n"
+    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
+    f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} when trend NOT qualifying</code>\n"
+    f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
     f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
