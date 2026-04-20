@@ -25,18 +25,18 @@ EMA_PERIOD           = 200
 LOOKBACK             = 250      # candles to count below EMA
 BELOW_PCT_MIN        = 65.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
-SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
+SL_BELOW_EMA_PCT     = 0.8      # SL = EMA × (1 - this/100)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
 MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
 PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 
 # ─── SLOPE FILTER ────────────────────────────────────────────────────────────
-# Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = 0.05
+# Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = -0.2
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = 0.05     # min EMA slope % to qualify  (Pine default: 0.05)
+MIN_EMA_SLOPE_PCT    = 0.02     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -65,16 +65,21 @@ MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (
 # bounce. A coin that crossed down and sat there 2% below EMA is probably
 # ranging, not reversing.
 #
-# Algorithm:
-#   1. Scan the last DROP_LOOKBACK candles, find the FIRST crossdown
-#      (close went from ≥EMA → <EMA) chronologically — the earliest one.
-#   2. If no crossdown found → price was already below EMA at start of window;
-#      use start of window as the anchor instead.
-#   3. Compute drop% = (EMA_at_anchor - lowest_low_since_anchor) / EMA_at_anchor × 100
+# Algorithm (measures peak-to-trough dump magnitude):
+#   1. Scan the last DROP_LOOKBACK candles for ALL crossdowns
+#      (close went from ≥EMA → <EMA). Multiple are common in choppy periods.
+#   2a. One or more crossdowns FOUND:
+#         upper_hinge = MAX(EMA value at each crossdown bar)
+#                       (the "top of the damage" reference)
+#         lower       = LOWEST LOW across the entire DROP_LOOKBACK window
+#   2b. No crossdown (price was already below EMA throughout the window):
+#         upper_hinge = HIGHEST HIGH across the window
+#         lower       = LOWEST LOW across the window
+#   3. drop% = (upper_hinge - lower) / upper_hinge × 100
 #   4. Require drop% ≥ MIN_DROP_PCT
 USE_DROP_FILTER      = True
-DROP_LOOKBACK        = 150       # candles to scan for crossdown anchor
-MIN_DROP_PCT         = 10.0      # min drop % from anchor EMA to lowest low
+DROP_LOOKBACK        = 250       # candles to scan
+MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION           = "15"     # CoinDCX 15-minute candles
@@ -625,40 +630,62 @@ def check_and_trade(symbol, row, df, all_state):
     breakout_vol_ok = (vol_avg > 0) and (last_vol > vol_avg * BREAKOUT_VOL_MULT)
 
     # ─── Crossdown drop filter ──────────────────────────────────────────────
-    # Find the FIRST crossdown (close went from ≥EMA → <EMA) within the last
-    # DROP_LOOKBACK candles. Use that bar as the drop anchor. If no crossdown
-    # is found in the window, price was already below EMA at the start of the
-    # window — use the start of window itself as the anchor. Then compute:
-    #     drop_pct = (EMA_at_anchor - lowest_low_since_anchor) / EMA_at_anchor × 100
-    # Require drop_pct ≥ MIN_DROP_PCT.
+    # Measure how much the coin dumped — only trade reversals with real damage.
+    #
+    # Step 1: Scan the last DROP_LOOKBACK candles for ALL crossdowns
+    #         (close went from ≥EMA → <EMA). There may be multiple.
+    #
+    # Step 2a — One or more crossdowns FOUND:
+    #   Of all those crossdown bars, pick the one where EMA value is HIGHEST.
+    #   This picks the "top of the damage" — in a real downtrend, the EMA at
+    #   the first crossdown is usually highest, but if EMA is still rising or
+    #   flat we want the best peak reference available.
+    #       upper_hinge = max(EMA_at_each_crossdown)
+    #       lower       = LOWEST LOW across the entire DROP_LOOKBACK window
+    #
+    # Step 2b — No crossdowns (price was already below EMA throughout):
+    #       upper_hinge = HIGHEST HIGH across the window
+    #       lower       = LOWEST LOW across the window
+    #
+    # Step 3: drop_pct = (upper_hinge - lower) / upper_hinge × 100
+    #         drop_ok  = drop_pct ≥ MIN_DROP_PCT
     n_candles      = len(closes)
     drop_start_idx = max(0, n_candles - DROP_LOOKBACK)
-    anchor_idx     = None
+    window_lows    = lows[drop_start_idx:]
+    window_highs   = highs[drop_start_idx:]
+    lowest_in_window  = min(window_lows)  if window_lows  else 0
+    highest_in_window = max(window_highs) if window_highs else 0
 
-    # Walk forward through the window looking for the first crossdown
+    # Collect ALL crossdown events and the EMA values at each
+    crossdown_emas = []   # list of (bar_index, ema_at_that_bar)
     for i in range(drop_start_idx + 1, n_candles):
         e_prev_i = ema_values[i - 1]
         e_now_i  = ema_values[i]
         if e_prev_i is None or e_now_i is None:
             continue
         if closes[i - 1] >= e_prev_i and closes[i] < e_now_i:
-            anchor_idx = i
-            break
+            crossdown_emas.append((i, e_now_i))
 
-    # Fallback: no crossdown in window → use start of window as anchor
-    drop_anchor_type = "crossdown" if anchor_idx is not None else "window_start"
-    if anchor_idx is None:
-        anchor_idx = drop_start_idx
+    if crossdown_emas:
+        # Pick the crossdown with the HIGHEST EMA value as upper hinge
+        best_xd_idx, upper_hinge = max(crossdown_emas, key=lambda t: t[1])
+        drop_anchor_type   = "crossdown"
+        crossdown_count    = len(crossdown_emas)
+        chosen_crossdown_i = best_xd_idx
+    else:
+        # No crossdown → price was already below EMA throughout the window
+        upper_hinge        = highest_in_window
+        drop_anchor_type   = "highest_high"
+        crossdown_count    = 0
+        chosen_crossdown_i = None
 
-    anchor_ema = ema_values[anchor_idx]
-    if anchor_ema is None or anchor_ema <= 0:
-        # EMA not available at anchor — cannot evaluate, fail-safe to NOT pass filter
+    if upper_hinge is None or upper_hinge <= 0 or lowest_in_window <= 0:
+        # Data not usable — fail-safe to NOT pass filter (unless filter disabled)
         drop_pct = 0.0
         drop_ok  = (not USE_DROP_FILTER)
     else:
-        lowest_since = min(lows[anchor_idx:])
-        drop_pct     = (anchor_ema - lowest_since) / anchor_ema * 100.0
-        drop_ok      = (not USE_DROP_FILTER) or (drop_pct >= MIN_DROP_PCT)
+        drop_pct = (upper_hinge - lowest_in_window) / upper_hinge * 100.0
+        drop_ok  = (not USE_DROP_FILTER) or (drop_pct >= MIN_DROP_PCT)
 
     # Momentum (close > close N bars ago) — Path B only
     price_rising = closes[-1] > closes[-1 - MOMENTUM_LOOKBACK]
@@ -820,7 +847,7 @@ def check_and_trade(symbol, row, df, all_state):
         f"below%={round(below_pct_actual, 1)} (need >={BELOW_PCT_MIN}) | "
         f"slope%={round(ema_slope_pct, 3)} (need >={MIN_EMA_SLOPE_PCT}) | "
         f"vol={round(last_vol, 2)} avg={round(vol_avg, 2)} ratio={vol_ratio}x | "
-        f"drop%={round(drop_pct, 2)} from {drop_anchor_type} (need >={MIN_DROP_PCT}) | "
+        f"drop%={round(drop_pct, 2)} from {drop_anchor_type} (xd_count={crossdown_count}, need >={MIN_DROP_PCT}) | "
         f"cross={cross_log} crossValid={cross_valid} | "
         f"distEMA={round(ema_distance_pct, 2)}% (max {MAX_EMA_DISTANCE_PCT}%) notOver={not_overextended} | "
         f"trendQ={trend_qualifies} slopeOK={slope_ok} volOK={vol_ok} dropOK={drop_ok} "
@@ -928,7 +955,7 @@ def check_and_trade(symbol, row, df, all_state):
             f"📉 Below %   : <code>{round(below_pct_actual, 1)}%</code>\n"
             f"📈 Slope %   : <code>{round(ema_slope_pct, 3)}%</code>\n"
             f"📦 Vol ratio : <code>{vol_ratio}x</code>\n"
-            f"📉 Drop %    : <code>{round(drop_pct, 2)}% (from {drop_anchor_type})</code>\n"
+            f"📉 Drop %    : <code>{round(drop_pct, 2)}% (from {drop_anchor_type}, {crossdown_count} crossdowns)</code>\n"
             f"🔀 Cross     : <code>{cross_detail}</code>\n"
             f"📏 Dist EMA  : <code>{round(ema_distance_pct, 2)}%</code>\n"
             f"🎯 Proximity : <code>{round(proximity_level, precision)}</code>\n"
@@ -1004,7 +1031,7 @@ send_telegram(
     f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
     f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + drop≥{MIN_DROP_PCT}% when trend NOT qualifying</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
-    f"📉 Drop       : <code>from first crossdown in last {DROP_LOOKBACK} bars (or window start if never crossed), EMA→lowest-low must be ≥{MIN_DROP_PCT}%</code>\n"
+    f"📉 Drop       : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} bars must be ≥{MIN_DROP_PCT}%</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
     f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
