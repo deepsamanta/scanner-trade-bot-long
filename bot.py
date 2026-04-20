@@ -23,9 +23,9 @@ BASE_URL = "https://api.coindcx.com"
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
 LOOKBACK             = 250      # candles to count below EMA
-BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
+BELOW_PCT_MIN        = 60.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
-SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
+SL_BELOW_EMA_PCT     = .8      # SL = EMA × (1 - this/100)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
 MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
@@ -36,7 +36,7 @@ PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = -0.1     # min EMA slope % to qualify  (Pine default: -0.2)
+MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -58,6 +58,14 @@ MOMENTUM_LOOKBACK    = 5        # close > close[N] bars ago
 # must still pass on the CURRENT bar, exactly as before.
 CROSS_LOOKBACK        = 5        # accept crossover from last N bars (incl. current)
 MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (anti-chase)
+
+# ─── VOLATILITY FILTER (range over lookback window) ──────────────────────────
+# Rejects dead / low-range coins that don't have enough movement to realistically
+# reach the 2.5% TP. Measured across the same LOOKBACK window used for the
+# "% below EMA" check (150 candles = ~37.5 hours on 15m).
+# Formula: (highest_high - lowest_low) / lowest_low × 100  ≥  MIN_RANGE_PCT
+USE_RANGE_FILTER     = True
+MIN_RANGE_PCT        = 10.0      # min high-low range % across last LOOKBACK candles
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION           = "15"     # CoinDCX 15-minute candles
@@ -539,12 +547,35 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[SKIP] {symbol} — insufficient candles ({len(candles)})")
         return
 
+    # ─── Use CLOSED candles only ─────────────────────────────────────────────
+    # CoinDCX returns candles including the currently-forming bar at the end.
+    # Acting on the in-progress bar causes intrabar false signals: e.g. price
+    # briefly spikes above EMA mid-bar, bot enters, bar closes back below.
+    # Pine Script's default behavior is to run strategies on bar close only,
+    # so we drop the last (live) candle and treat candles[-1] (now the prior
+    # bar) as the most recent CONFIRMED close.
+    if len(candles) >= 2:
+        now_ms           = int(time.time() * 1000)
+        last_candle_time = int(candles[-1]["time"])
+        bar_elapsed_ms   = now_ms - last_candle_time
+        # A bar is "closed" if more than CANDLE_SECONDS has passed since it opened.
+        # If the last bar is still forming (elapsed < CANDLE_SECONDS), drop it.
+        if bar_elapsed_ms < CANDLE_SECONDS * 1000:
+            candles = candles[:-1]
+            print(f"[{symbol}] Dropping in-progress bar ({bar_elapsed_ms/1000:.0f}s elapsed of {CANDLE_SECONDS}s)")
+
+    # Revalidate after dropping
+    if len(candles) < EMA_PERIOD + LOOKBACK + 5:
+        print(f"[SKIP] {symbol} — insufficient closed candles ({len(candles)})")
+        return
+
     precision = get_precision(candles[-1]["close"])
     closes    = [float(c["close"])  for c in candles]
+    highs     = [float(c["high"])   for c in candles]
     lows      = [float(c["low"])    for c in candles]
     volumes   = [float(c.get("volume", 0)) for c in candles]
 
-    last_close = closes[-1]
+    last_close = closes[-1]   # most recent CONFIRMED close (bar is closed)
     last_low   = lows[-1]
     last_ts    = int(candles[-1]["time"])   # milliseconds
 
@@ -583,6 +614,18 @@ def check_and_trade(symbol, row, df, all_state):
     last_vol   = volumes[-1]
     vol_ok          = (not USE_VOLUME_FILTER) or (vol_avg > 0 and last_vol > vol_avg * VOL_MULTIPLIER)
     breakout_vol_ok = (vol_avg > 0) and (last_vol > vol_avg * BREAKOUT_VOL_MULT)
+
+    # ─── Volatility / range filter ───────────────────────────────────────────
+    # Look at the last LOOKBACK bars. Take the single highest HIGH and lowest LOW.
+    # Compute range% = (highest - lowest) / lowest × 100.
+    # A coin trading in a 2–3% channel for 37 hours won't realistically reach
+    # our 2.5% TP, so we skip it entirely.
+    range_window_highs = highs[-LOOKBACK:]
+    range_window_lows  = lows[-LOOKBACK:]
+    window_high        = max(range_window_highs) if range_window_highs else 0
+    window_low         = min(range_window_lows)  if range_window_lows  else 0
+    range_pct          = ((window_high - window_low) / window_low * 100.0) if window_low > 0 else 0
+    range_ok           = (not USE_RANGE_FILTER) or (range_pct >= MIN_RANGE_PCT)
 
     # Momentum (close > close N bars ago) — Path B only
     price_rising = closes[-1] > closes[-1 - MOMENTUM_LOOKBACK]
@@ -744,9 +787,10 @@ def check_and_trade(symbol, row, df, all_state):
         f"below%={round(below_pct_actual, 1)} (need >={BELOW_PCT_MIN}) | "
         f"slope%={round(ema_slope_pct, 3)} (need >={MIN_EMA_SLOPE_PCT}) | "
         f"vol={round(last_vol, 2)} avg={round(vol_avg, 2)} ratio={vol_ratio}x | "
+        f"range%={round(range_pct, 2)} (need >={MIN_RANGE_PCT}) | "
         f"cross={cross_log} crossValid={cross_valid} | "
         f"distEMA={round(ema_distance_pct, 2)}% (max {MAX_EMA_DISTANCE_PCT}%) notOver={not_overextended} | "
-        f"trendQ={trend_qualifies} slopeOK={slope_ok} volOK={vol_ok} "
+        f"trendQ={trend_qualifies} slopeOK={slope_ok} volOK={vol_ok} rangeOK={range_ok} "
         f"priceRising={price_rising} waitingRetest={st['waiting_retest']}"
     )
 
@@ -832,13 +876,14 @@ def check_and_trade(symbol, row, df, all_state):
                  and cross_valid
                  and slope_ok
                  and vol_ok
+                 and range_ok
                  and not st["waiting_retest"])
 
     if new_setup:
         cross_detail = "strict" if cross_up_strict else f"rescued ({cross_bars_ago}b ago)"
         print(
             f"[SETUP ARMED] {symbol} — trendQ ✓ cross:{cross_detail} ✓ "
-            f"slope ✓ vol ✓ → waiting retest"
+            f"slope ✓ vol ✓ range ✓ → waiting retest"
         )
         st["waiting_retest"]       = True
         st["wait_start_candle_ts"] = last_ts
@@ -850,6 +895,7 @@ def check_and_trade(symbol, row, df, all_state):
             f"📉 Below %   : <code>{round(below_pct_actual, 1)}%</code>\n"
             f"📈 Slope %   : <code>{round(ema_slope_pct, 3)}%</code>\n"
             f"📦 Vol ratio : <code>{vol_ratio}x</code>\n"
+            f"📐 Range %   : <code>{round(range_pct, 2)}%</code>\n"
             f"🔀 Cross     : <code>{cross_detail}</code>\n"
             f"📏 Dist EMA  : <code>{round(ema_distance_pct, 2)}%</code>\n"
             f"🎯 Proximity : <code>{round(proximity_level, precision)}</code>\n"
@@ -872,10 +918,11 @@ def check_and_trade(symbol, row, df, all_state):
         breakout_entry = ((not trend_qualifies)
                           and cross_valid
                           and price_rising
-                          and breakout_vol_ok)
+                          and breakout_vol_ok
+                          and range_ok)
         if breakout_entry:
             cross_detail = "strict" if cross_up_strict else f"rescued ({cross_bars_ago}b ago)"
-            print(f"[BREAKOUT] {symbol} — entering long (Path B, cross:{cross_detail})")
+            print(f"[BREAKOUT] {symbol} — entering long (Path B, cross:{cross_detail}, range:{round(range_pct, 2)}%)")
 
             # Final guard
             if get_position_by_pair(symbol) is not None:
@@ -920,10 +967,11 @@ send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy   : <code>200 EMA Dual-Path (Reversal + Breakout)</code>\n"
-    f"⏱ Timeframe  : <code>15 Min</code>\n"
-    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
-    f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} when trend NOT qualifying</code>\n"
+    f"⏱ Timeframe  : <code>15 Min (closed bars only)</code>\n"
+    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + range≥{MIN_RANGE_PCT}% → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
+    f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + range≥{MIN_RANGE_PCT}% when trend NOT qualifying</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
+    f"📐 Range      : <code>last {LOOKBACK} bars high-low span must be ≥{MIN_RANGE_PCT}%</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
     f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
