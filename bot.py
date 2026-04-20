@@ -22,7 +22,7 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 150      # candles to count below EMA
+LOOKBACK             = 250      # candles to count below EMA
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
@@ -36,7 +36,7 @@ PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify  (Pine default: -0.2)
+MIN_EMA_SLOPE_PCT    = -0.1     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
