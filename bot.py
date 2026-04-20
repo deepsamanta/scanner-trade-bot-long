@@ -22,7 +22,7 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 250      # candles to count below EMA
+LOOKBACK             = 150      # candles to count below EMA
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
@@ -35,8 +35,8 @@ PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 # Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = -0.2
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
-SLOPE_BARS           = 5       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = 0.05     # min EMA slope % to qualify  (Pine default: -0.2)
+SLOPE_BARS           = 10       # % change of EMA over this many bars
+MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -324,6 +324,40 @@ def fetch_candles(symbol, num_candles_needed):
 
 
 # =====================================================
+# RECENT HIGH — wick-based TP detection
+# =====================================================
+
+def get_recent_high(symbol):
+    """
+    Fetches 1-min candles over the last SCAN_INTERVAL seconds to check if
+    price wicked up to touch a stored TP between scans. Without this, a TP
+    that was hit by a wick (but not by a 15m close) would be missed, and the
+    bot would keep seeing the numeric TP in col B and treat the coin as still
+    in a live trade.
+    """
+    try:
+        pair_api = fut_pair(symbol)
+        url  = "https://public.coindcx.com/market_data/candlesticks"
+        now  = int(time.time())
+        params = {
+            "pair":       pair_api,
+            "from":       now - SCAN_INTERVAL,
+            "to":         now,
+            "resolution": "1",
+            "pcode":      "f",
+        }
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        candles  = response.json().get("data", [])
+        if not candles:
+            return None
+        highs = [float(c["high"]) for c in candles]
+        return max(highs)
+    except Exception as e:
+        print(f"[RECENT HIGH] {symbol} error: {e}")
+        return None
+
+
+# =====================================================
 # POSITIONS & ORDERS
 # =====================================================
 
@@ -585,6 +619,70 @@ def check_and_trade(symbol, row, df, all_state):
     if st is None:
         st = init_symbol_state()
         all_state[symbol] = st
+
+    # =========================================================================
+    # TP COMPLETED MONITORING  (matches sample bot behavior)
+    # =========================================================================
+    # Runs BEFORE the position/order checks so it fires even while a trade is
+    # live on the exchange. Critical: if we only ran this after position checks,
+    # we'd miss the TP event because:
+    #   - While position exists → early return skips this block
+    #   - After position closes via TP → price may already be back below TP,
+    #     so Rules 2 & 3 would fail and col B would stay numeric forever
+    #
+    # Col B semantics:
+    #   - "" or empty     : no live trade on this coin; scanning allowed
+    #   - numeric (float) : live trade — stored TP price for this coin
+    #   - "TP COMPLETED"  : most recent trade closed at TP; do NOT re-enter
+    # =========================================================================
+    tp_raw = df.iloc[row, 1] if df.shape[1] > 1 else ""
+
+    # Rule 1: explicit "TP COMPLETED" marker — skip this symbol entirely
+    if str(tp_raw).strip().upper() == "TP COMPLETED":
+        print(f"[SKIP] {symbol} — TP COMPLETED marker in sheet, not re-entering")
+        save_state(all_state)
+        return
+
+    # Rules 2 & 3: if col B has a numeric TP, watch for it being hit.
+    try:
+        tp_stored = float(str(tp_raw).strip())
+    except (ValueError, TypeError):
+        tp_stored = None
+
+    if tp_stored is not None and tp_stored > 0:
+        tp_hit = False
+        hit_kind = None
+        hit_price = None
+
+        # Rule 2 — TP hit by current 15m CLOSE
+        if last_close >= tp_stored:
+            tp_hit    = True
+            hit_kind  = "close"
+            hit_price = last_close
+
+        # Rule 3 — TP hit by a WICK between scans (1-min high over last 15 min)
+        if not tp_hit:
+            recent_high = get_recent_high(symbol)
+            if recent_high is not None and recent_high >= tp_stored:
+                tp_hit    = True
+                hit_kind  = "wick"
+                hit_price = recent_high
+
+        if tp_hit:
+            update_sheet_tp(row, "TP COMPLETED")
+            print(f"[TP HIT] {symbol} — {hit_kind} {hit_price} ≥ stored TP {tp_stored}")
+            send_telegram(
+                f"🎯 <b>TP HIT ({hit_kind}) — {symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📍 {hit_kind.capitalize():8}: <code>{hit_price}</code>\n"
+                f"🎯 TP       : <code>{tp_stored}</code>\n"
+                f"✅ Marked <b>TP COMPLETED</b> in sheet — no further entries on this coin"
+            )
+            # Clear local position state — the exchange's TP leg will (or already did) close the position
+            if st.get("in_position"):
+                all_state[symbol] = init_symbol_state()
+            save_state(all_state)
+            return
 
     # =========================================================================
     # RECONCILE WITH EXCHANGE
