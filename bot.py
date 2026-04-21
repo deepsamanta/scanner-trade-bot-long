@@ -25,7 +25,7 @@ EMA_PERIOD           = 200
 LOOKBACK             = 250      # candles to count below EMA
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
-SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
+SL_BELOW_EMA_PCT     = 0.8      # SL = EMA × (1 - this/100)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
 MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
@@ -110,13 +110,13 @@ MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 USE_PATH_C                = True
 PATH_C_ENABLED_TIMEFRAMES = ["15", "30", "60", "240"]  # CoinDCX resolution strings
 PATH_C_CANDLES            = 600           # bars per TF
-PATH_C_MIN_DROP_PCT       = 6.5           # min drop from MOST RECENT crossdown
+PATH_C_MIN_DROP_PCT       = 5.0           # min drop from MOST RECENT crossdown
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
 PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 3             # minimum TFs defending a zone (3 of 4)
 PATH_C_MAX_WAIT_BARS      = 30            # max 15m bars to wait for bounce after arming
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
-PATH_C_SL_BELOW_ZONE_PCT  = 1.0           # SL placed this % below zone_low (Path C only, decoupled from Paths A/B)
+PATH_C_SL_BELOW_ZONE_PCT  = 0.8           # SL placed this % below zone_low (Path C only, decoupled from Paths A/B)
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION           = "15"     # CoinDCX 15-minute candles
@@ -940,27 +940,36 @@ def check_and_trade(symbol, row, df, all_state):
     # Paths A/B use `drop_pct` above (max-EMA across all crossdowns) because
     # they want to measure the total magnitude of damage.
     #
-    # Path C uses a different measurement: the drop from the MOST RECENT
-    # crossdown. Rationale: Path C is a support-bounce play looking for a
-    # recent dump that's now about to test a support zone. An old crossdown
-    # from 100 bars ago isn't relevant — we want to know how hard the coin
-    # has fallen in this current leg down.
+    # Path C uses a DIFFERENT measurement: only the CURRENT leg down, from
+    # the most recent crossdown to now.
+    #
+    # Rationale: Path C is a support-bounce play looking for a recent dump
+    # that's now about to test a support zone. If the lowest low in the 150-
+    # bar window happened during an unrelated earlier dump (say 80 bars ago)
+    # and the recent crossdown is 20 bars ago, mixing those inflates the drop
+    # artificially. We only care about how much the coin has fallen in this
+    # current leg.
     #
     # Formula:
-    #   - Most recent crossdown = LAST entry in crossdown_emas (list is
-    #     chronological since we built it forward through the window)
-    #   - upper = EMA at that most-recent crossdown bar
-    #   - lower = LOWEST LOW across the full DROP_LOOKBACK window
-    #     (captures the deepest point price reached, regardless of timing)
-    #   - drop_pct_path_c = (upper - lower) / upper × 100
+    #   - recent_xd_idx    = LAST entry in crossdown_emas (most recent cut)
+    #   - upper            = EMA at recent_xd_idx
+    #   - lower_since_xd   = min(lows[recent_xd_idx:])
+    #                        ← only bars from the recent crossdown onwards
+    #   - drop_pct_path_c  = (upper - lower_since_xd) / upper × 100
     #
     # Fallback: if no crossdown exists in the window, reuse the general
     # drop_pct (which already handles the "already below EMA" case via
     # the highest_high anchor).
     if crossdown_emas:
         recent_xd_idx, recent_xd_ema = crossdown_emas[-1]
-        if recent_xd_ema and recent_xd_ema > 0 and lowest_in_window > 0:
-            drop_pct_path_c = (recent_xd_ema - lowest_in_window) / recent_xd_ema * 100.0
+        # Only consider lows from the recent crossdown bar to the current bar.
+        # This restricts the measurement to the CURRENT leg down and ignores
+        # any older deeper lows from earlier dumps that have since recovered.
+        lows_since_recent_xd = lows[recent_xd_idx:]
+        lowest_since_recent_xd = min(lows_since_recent_xd) if lows_since_recent_xd else 0
+
+        if recent_xd_ema and recent_xd_ema > 0 and lowest_since_recent_xd > 0:
+            drop_pct_path_c = (recent_xd_ema - lowest_since_recent_xd) / recent_xd_ema * 100.0
             path_c_drop_anchor = f"recent_crossdown@{recent_xd_idx}"
         else:
             drop_pct_path_c = 0.0
