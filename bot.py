@@ -22,7 +22,7 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 150      # candles to count below EMA
+LOOKBACK             = 250      # candles to count below EMA
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
@@ -36,7 +36,7 @@ PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify  (Pine default: -0.2)
+MIN_EMA_SLOPE_PCT    = 0.02     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -57,7 +57,7 @@ MOMENTUM_LOOKBACK    = 5        # close > close[N] bars ago
 # still above EMA and not overextended. All other filters (trend, slope, vol)
 # must still pass on the CURRENT bar, exactly as before.
 CROSS_LOOKBACK        = 5        # accept crossover from last N bars (incl. current)
-MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (anti-chase)
+MAX_EMA_DISTANCE_PCT  = 1.5      # don't arm if price is already >X% above EMA (anti-chase)
 
 # ─── CROSSDOWN DROP FILTER ───────────────────────────────────────────────────
 # Rejects coins that drifted below EMA without a real dump. The intent: only
@@ -78,7 +78,7 @@ MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (
 #   3. drop% = (upper_hinge - lower) / upper_hinge × 100
 #   4. Require drop% ≥ MIN_DROP_PCT
 USE_DROP_FILTER      = True
-DROP_LOOKBACK        = 150       # candles to scan
+DROP_LOOKBACK        = 250       # candles to scan
 MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 
 # ─── PATH C: SUPPORT BOUNCE (multi-timeframe pivot confluence) ───────────────
@@ -110,7 +110,7 @@ MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 USE_PATH_C                = True
 PATH_C_ENABLED_TIMEFRAMES = ["15", "30", "60", "240"]  # CoinDCX resolution strings
 PATH_C_CANDLES            = 600           # bars per TF
-PATH_C_MIN_DROP_PCT       = 5.0           # min drop from MOST RECENT crossdown
+PATH_C_MIN_DROP_PCT       = 6.5           # min drop from MOST RECENT crossdown
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
 PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 3             # minimum TFs defending a zone (3 of 4)
