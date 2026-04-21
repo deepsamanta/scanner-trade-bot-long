@@ -95,7 +95,10 @@ MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 # 3 of 4 timeframes have pivots is a meaningful structural level.
 #
 # Flow:
-#   1. Coin dumped ≥PATH_C_MIN_DROP_PCT from highest-EMA crossdown
+#   1. Coin dumped ≥PATH_C_MIN_DROP_PCT from the MOST RECENT crossdown
+#      (uses a different drop measurement than Paths A/B, which use max-EMA).
+#      Fallback: if no crossdown in window, reuse the general drop_pct
+#      (max-EMA / highest-high based).
 #   2. Find all pivots (highs + lows) in 600-bar windows on each of 4 TFs
 #   3. Cluster pivots that fall within PIVOT_ZONE_PCT of each other into zones
 #   4. Keep only zones defended by ≥MIN_TF_CONFLUENCE timeframes
@@ -107,7 +110,7 @@ MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 USE_PATH_C                = True
 PATH_C_ENABLED_TIMEFRAMES = ["15", "30", "60", "240"]  # CoinDCX resolution strings
 PATH_C_CANDLES            = 600           # bars per TF
-PATH_C_MIN_DROP_PCT       = 5.0           # min drop from highest-EMA crossdown
+PATH_C_MIN_DROP_PCT       = 5.0           # min drop from MOST RECENT crossdown
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
 PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 3             # minimum TFs defending a zone (3 of 4)
@@ -933,6 +936,40 @@ def check_and_trade(symbol, row, df, all_state):
         drop_pct = (upper_hinge - lowest_in_window) / upper_hinge * 100.0
         drop_ok  = (not USE_DROP_FILTER) or (drop_pct >= MIN_DROP_PCT)
 
+    # ─── Path C drop variant ────────────────────────────────────────────────
+    # Paths A/B use `drop_pct` above (max-EMA across all crossdowns) because
+    # they want to measure the total magnitude of damage.
+    #
+    # Path C uses a different measurement: the drop from the MOST RECENT
+    # crossdown. Rationale: Path C is a support-bounce play looking for a
+    # recent dump that's now about to test a support zone. An old crossdown
+    # from 100 bars ago isn't relevant — we want to know how hard the coin
+    # has fallen in this current leg down.
+    #
+    # Formula:
+    #   - Most recent crossdown = LAST entry in crossdown_emas (list is
+    #     chronological since we built it forward through the window)
+    #   - upper = EMA at that most-recent crossdown bar
+    #   - lower = LOWEST LOW across the full DROP_LOOKBACK window
+    #     (captures the deepest point price reached, regardless of timing)
+    #   - drop_pct_path_c = (upper - lower) / upper × 100
+    #
+    # Fallback: if no crossdown exists in the window, reuse the general
+    # drop_pct (which already handles the "already below EMA" case via
+    # the highest_high anchor).
+    if crossdown_emas:
+        recent_xd_idx, recent_xd_ema = crossdown_emas[-1]
+        if recent_xd_ema and recent_xd_ema > 0 and lowest_in_window > 0:
+            drop_pct_path_c = (recent_xd_ema - lowest_in_window) / recent_xd_ema * 100.0
+            path_c_drop_anchor = f"recent_crossdown@{recent_xd_idx}"
+        else:
+            drop_pct_path_c = 0.0
+            path_c_drop_anchor = "invalid"
+    else:
+        # No crossdown → reuse the general drop_pct (highest_high based)
+        drop_pct_path_c = drop_pct
+        path_c_drop_anchor = f"fallback_{drop_anchor_type}"
+
     # Momentum (close > close N bars ago) — Path B only
     price_rising = closes[-1] > closes[-1 - MOMENTUM_LOOKBACK]
 
@@ -1094,10 +1131,12 @@ def check_and_trade(symbol, row, df, all_state):
         f"slope%={round(ema_slope_pct, 3)} (need >={MIN_EMA_SLOPE_PCT}) | "
         f"vol={round(last_vol, 2)} avg={round(vol_avg, 2)} ratio={vol_ratio}x | "
         f"drop%={round(drop_pct, 2)} from {drop_anchor_type} (xd_count={crossdown_count}, need >={MIN_DROP_PCT}) | "
+        f"dropC%={round(drop_pct_path_c, 2)} from {path_c_drop_anchor} (need >={PATH_C_MIN_DROP_PCT}) | "
         f"cross={cross_log} crossValid={cross_valid} | "
         f"distEMA={round(ema_distance_pct, 2)}% (max {MAX_EMA_DISTANCE_PCT}%) notOver={not_overextended} | "
         f"trendQ={trend_qualifies} slopeOK={slope_ok} volOK={vol_ok} dropOK={drop_ok} "
-        f"priceRising={price_rising} waitingRetest={st['waiting_retest']}"
+        f"priceRising={price_rising} waitingRetest={st['waiting_retest']} "
+        f"pathC_armed={st.get('path_c_armed', False)}"
     )
 
     # =========================================================================
@@ -1389,10 +1428,11 @@ def check_and_trade(symbol, row, df, all_state):
                 return
 
         # ── STAGE 2: not armed — evaluate whether to arm a new zone ────────
-        # Prereq: drop from highest-EMA crossdown ≥ PATH_C_MIN_DROP_PCT
-        # We already have drop_pct computed earlier. Path C uses a lower
-        # threshold (5%) than Path A/B's 10%.
-        path_c_drop_ok = drop_pct >= PATH_C_MIN_DROP_PCT
+        # Prereq: Path C-specific drop measurement ≥ PATH_C_MIN_DROP_PCT.
+        # This uses the MOST RECENT crossdown (not the max-EMA one used by
+        # Paths A/B) to measure the current leg down. Falls back to the
+        # general drop_pct if no crossdown exists in the window.
+        path_c_drop_ok = drop_pct_path_c >= PATH_C_MIN_DROP_PCT
 
         if path_c_drop_ok:
             # Find the nearest confluence support zone below current price
@@ -1412,7 +1452,7 @@ def check_and_trade(symbol, row, df, all_state):
 
                     print(f"[PATH-C] {symbol} — ARMING zone {round(zone_low, precision)}–{round(zone_high, precision)} "
                           f"(center {round(zone_cent, precision)}, {tf_count} TFs: {tfs_str}, "
-                          f"{round(dist_pct, 2)}% below close, drop {round(drop_pct, 2)}%)")
+                          f"{round(dist_pct, 2)}% below close, drop_c {round(drop_pct_path_c, 2)}% from {path_c_drop_anchor})")
 
                     st["path_c_armed"]        = True
                     st["path_c_zone_low"]     = zone_low
@@ -1430,7 +1470,7 @@ def check_and_trade(symbol, row, df, all_state):
                         f"🧱 Zone high  : <code>{round(zone_high, precision)}</code>\n"
                         f"📊 Zone cent  : <code>{round(zone_cent, precision)}</code>\n"
                         f"⏬ Dist below : <code>{round(dist_pct, 2)}%</code>\n"
-                        f"📉 Drop       : <code>{round(drop_pct, 2)}%</code>\n"
+                        f"📉 Drop (C)   : <code>{round(drop_pct_path_c, 2)}% ({path_c_drop_anchor})</code>\n"
                         f"🪢 Confluence : <code>{tf_count} TFs ({tfs_str})</code>\n"
                         f"⌛ Waiting up to {PATH_C_MAX_WAIT_BARS} × 15m bars for bounce"
                     )
@@ -1456,7 +1496,7 @@ send_telegram(
     f"⏱ Timeframe  : <code>15 Min (closed bars only)</code>\n"
     f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
     f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + drop≥{MIN_DROP_PCT}% when trend NOT qualifying</code>\n"
-    f"🆎 Path C    : <code>drop≥{PATH_C_MIN_DROP_PCT}% + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → wait bounce + 15m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
+    f"🆎 Path C    : <code>drop≥{PATH_C_MIN_DROP_PCT}% (from most-recent crossdown) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → wait bounce + 15m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
     f"📉 Drop       : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} bars must be ≥{MIN_DROP_PCT}%</code>\n"
     f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: {', '.join(PATH_C_ENABLED_TIMEFRAMES)}m/h</code>\n"
