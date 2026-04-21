@@ -22,10 +22,10 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 250      # candles to count below EMA
-BELOW_PCT_MIN        = 65.0     # min % of last LOOKBACK candles below EMA
+LOOKBACK             = 150      # candles to count below EMA
+BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
 TP_PCT               = 2.5      # Take Profit % (fixed above entry)
-SL_BELOW_EMA_PCT     = 0.8      # SL = EMA × (1 - this/100)
+SL_BELOW_EMA_PCT     = 1.0      # SL = EMA × (1 - this/100)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
 MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
@@ -36,7 +36,7 @@ PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 # Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = 0.02     # min EMA slope % to qualify  (Pine default: -0.2)
+MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify  (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -78,8 +78,42 @@ MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (
 #   3. drop% = (upper_hinge - lower) / upper_hinge × 100
 #   4. Require drop% ≥ MIN_DROP_PCT
 USE_DROP_FILTER      = True
-DROP_LOOKBACK        = 250       # candles to scan
+DROP_LOOKBACK        = 150       # candles to scan
 MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
+
+# ─── PATH C: SUPPORT BOUNCE (multi-timeframe pivot confluence) ───────────────
+# Alternative long-entry path for coins that have dumped ≥5% from the top of
+# the EMA damage and are now heading toward a historically defended zone.
+#
+# "Support zone" = a horizontal price band where price previously reversed
+# direction — this includes both pivot HIGHS (prior resistance that may flip
+# to support) and pivot LOWS (prior bounce levels). Any bar that was a local
+# extreme counts as a reactive level.
+#
+# Confluence across 4 timeframes (15m / 30m / 1h / 4h) identifies zones that
+# matter on multiple scales — a single 15m pivot is noise, but a zone where
+# 3 of 4 timeframes have pivots is a meaningful structural level.
+#
+# Flow:
+#   1. Coin dumped ≥PATH_C_MIN_DROP_PCT from highest-EMA crossdown
+#   2. Find all pivots (highs + lows) in 600-bar windows on each of 4 TFs
+#   3. Cluster pivots that fall within PIVOT_ZONE_PCT of each other into zones
+#   4. Keep only zones defended by ≥MIN_TF_CONFLUENCE timeframes
+#   5. Filter to zones BELOW current price → price is expected to find support here
+#   6. Pick the NEAREST zone below current price (the first floor the coin will test)
+#   7. Arm the setup and wait for a bounce: a 15m bar closes above the zone
+#      AFTER price has traded at or below the zone center
+#   8. Enter long on the reclaim bar
+USE_PATH_C                = True
+PATH_C_ENABLED_TIMEFRAMES = ["15", "30", "60", "240"]  # CoinDCX resolution strings
+PATH_C_CANDLES            = 600           # bars per TF
+PATH_C_MIN_DROP_PCT       = 5.0           # min drop from highest-EMA crossdown
+PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
+PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
+MIN_TF_CONFLUENCE         = 3             # minimum TFs defending a zone (3 of 4)
+PATH_C_MAX_WAIT_BARS      = 30            # max 15m bars to wait for bounce after arming
+PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
+PATH_C_SL_BELOW_ZONE_PCT  = 1.0           # SL placed this % below zone_low (Path C only, decoupled from Paths A/B)
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION           = "15"     # CoinDCX 15-minute candles
@@ -193,10 +227,20 @@ def save_state(state):
 
 def init_symbol_state():
     return {
+        # ── Path A state ─────────────────────────────────────────────────
         "waiting_retest":        False,
         "wait_start_candle_ts":  None,    # ms timestamp of the candle when armed
+        # ── Path C state (support bounce) ────────────────────────────────
+        "path_c_armed":          False,
+        "path_c_start_ts":       None,    # ms timestamp when zone was armed
+        "path_c_zone_low":       None,    # lower edge of support zone
+        "path_c_zone_high":      None,    # upper edge of support zone
+        "path_c_zone_center":    None,    # midpoint (for entry comparisons)
+        "path_c_zone_touched":   False,   # has price dipped into the zone yet?
+        "path_c_tf_count":       None,    # how many TFs defended this zone (log/telegram only)
+        # ── Common position state ────────────────────────────────────────
         "in_position":           False,
-        "entry_path":            None,    # "retest" or "breakout"
+        "entry_path":            None,    # "retest", "breakout", or "support_bounce"
         "entry_price":           None,
         "tp_level":              None,
         "sl_price":              None,
@@ -343,6 +387,208 @@ def fetch_candles(symbol, num_candles_needed):
     except Exception as e:
         print(f"[CANDLES] {symbol} fetch error: {e}")
         return []
+
+
+def fetch_candles_tf(symbol, resolution_str, num_candles_needed):
+    """
+    Generic multi-timeframe candle fetch. `resolution_str` must be a CoinDCX
+    resolution: "15", "30", "60", "240", "1D". Returns a list of dicts with
+    keys: time, open, high, low, close, volume.
+    """
+    # Map resolution string to seconds per candle
+    res_to_seconds = {
+        "1":    60,
+        "5":    5 * 60,
+        "15":   15 * 60,
+        "30":   30 * 60,
+        "60":   60 * 60,
+        "240":  4  * 60 * 60,
+        "1D":   24 * 60 * 60,
+    }
+    seconds_per_candle = res_to_seconds.get(resolution_str, CANDLE_SECONDS)
+
+    pair_api = fut_pair(symbol)
+    url      = "https://public.coindcx.com/market_data/candlesticks"
+    now      = int(time.time())
+    fetch_seconds = (num_candles_needed + 50) * seconds_per_candle
+
+    params = {
+        "pair":       pair_api,
+        "from":       now - fetch_seconds,
+        "to":         now,
+        "resolution": resolution_str,
+        "pcode":      "f",
+    }
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        data     = response.json().get("data", [])
+        candles  = sorted(data, key=lambda x: x["time"])
+        return candles
+    except Exception as e:
+        print(f"[CANDLES-TF {resolution_str}] {symbol} fetch error: {e}")
+        return []
+
+
+# =====================================================
+# PIVOT DETECTION (Path C)
+# =====================================================
+
+def find_pivots(highs, lows, strength):
+    """
+    Returns a list of pivot prices found in the given candle series.
+    A bar is a PIVOT HIGH if its high is strictly greater than the highs of
+    the `strength` bars before AND the `strength` bars after.
+    A bar is a PIVOT LOW if its low is strictly less than the lows of the
+    `strength` bars before AND the `strength` bars after.
+
+    Both pivot types are treated the same way — they're "reactive levels"
+    where price changed direction. Returns a flat list of price values.
+
+    The most recent `strength` bars are excluded (we can't know yet if they
+    will become pivots until `strength` more bars form on the right side).
+    """
+    pivot_prices = []
+    n = len(highs)
+    if n < 2 * strength + 1:
+        return pivot_prices
+
+    for i in range(strength, n - strength):
+        h_center = highs[i]
+        l_center = lows[i]
+
+        # Pivot high check
+        is_pivot_high = True
+        for k in range(1, strength + 1):
+            if highs[i - k] >= h_center or highs[i + k] >= h_center:
+                is_pivot_high = False
+                break
+        if is_pivot_high:
+            pivot_prices.append(h_center)
+            continue  # same bar can't be both high and low pivot
+
+        # Pivot low check
+        is_pivot_low = True
+        for k in range(1, strength + 1):
+            if lows[i - k] <= l_center or lows[i + k] <= l_center:
+                is_pivot_low = False
+                break
+        if is_pivot_low:
+            pivot_prices.append(l_center)
+
+    return pivot_prices
+
+
+def cluster_pivots_to_zones(pivots_by_tf, proximity_pct):
+    """
+    Takes a dict { tf_label: [pivot_prices...] } and clusters pivots across
+    all timeframes into zones. Two pivots belong to the same zone if they are
+    within proximity_pct of each other (measured from the lower pivot).
+
+    Returns a list of zone dicts:
+      { "center": float,
+        "low":    float,
+        "high":   float,
+        "tfs":    set(tf_labels),  # which timeframes defend this zone
+        "pivots": [(price, tf), ...] }
+
+    Algorithm:
+      1. Flatten all pivots with their TF label
+      2. Sort ascending by price
+      3. Walk through in order, starting a new zone whenever the gap between
+         a pivot and the running zone center exceeds proximity_pct
+      4. Compute final zone bounds and TF membership
+    """
+    flat = []
+    for tf, prices in pivots_by_tf.items():
+        for p in prices:
+            if p > 0:
+                flat.append((p, tf))
+    if not flat:
+        return []
+
+    flat.sort(key=lambda t: t[0])
+
+    zones = []
+    current_pivots = [flat[0]]
+    current_center = flat[0][0]
+
+    for price, tf in flat[1:]:
+        # Distance from current zone center as %
+        gap_pct = abs(price - current_center) / current_center * 100.0
+        if gap_pct <= proximity_pct:
+            # Same zone
+            current_pivots.append((price, tf))
+            # Recenter as the running mean
+            current_center = sum(p for p, _ in current_pivots) / len(current_pivots)
+        else:
+            # Flush the current zone
+            zones.append(_finalize_zone(current_pivots))
+            current_pivots = [(price, tf)]
+            current_center = price
+
+    # Don't forget the last one
+    zones.append(_finalize_zone(current_pivots))
+    return zones
+
+
+def _finalize_zone(pivots):
+    """Helper: build a zone dict from a list of (price, tf) tuples."""
+    prices = [p for p, _ in pivots]
+    tfs    = {tf for _, tf in pivots}
+    return {
+        "center": sum(prices) / len(prices),
+        "low":    min(prices),
+        "high":   max(prices),
+        "tfs":    tfs,
+        "pivots": pivots,
+    }
+
+
+def find_nearest_support_zone_below(symbol, current_price):
+    """
+    Full Path C support-zone detection pipeline.
+
+    1. Fetch PATH_C_CANDLES bars on each timeframe in PATH_C_ENABLED_TIMEFRAMES
+    2. Compute pivots on each TF (both pivot highs and pivot lows)
+    3. Cluster all pivots across TFs into confluence zones (±PIVOT_ZONE_PCT)
+    4. Keep only zones defended by ≥MIN_TF_CONFLUENCE timeframes
+    5. Filter to zones strictly BELOW current_price
+    6. Return the NEAREST one (highest zone among those below current price)
+
+    Returns the zone dict, or None if no qualifying zone found.
+    """
+    pivots_by_tf = {}
+    for tf in PATH_C_ENABLED_TIMEFRAMES:
+        candles = fetch_candles_tf(symbol, tf, PATH_C_CANDLES)
+        if len(candles) < 2 * PIVOT_STRENGTH + 1:
+            print(f"[PATH-C] {symbol} TF {tf} — insufficient candles ({len(candles)}), skipping this TF")
+            continue
+        tf_highs = [float(c["high"]) for c in candles]
+        tf_lows  = [float(c["low"])  for c in candles]
+        pivots   = find_pivots(tf_highs, tf_lows, PIVOT_STRENGTH)
+        pivots_by_tf[tf] = pivots
+
+    if not pivots_by_tf:
+        return None
+
+    zones = cluster_pivots_to_zones(pivots_by_tf, PIVOT_ZONE_PCT)
+
+    # Keep only confluence zones with enough TF support
+    strong_zones = [z for z in zones if len(z["tfs"]) >= MIN_TF_CONFLUENCE]
+    if not strong_zones:
+        return None
+
+    # Filter to zones strictly below current price
+    # A zone's upper edge must be below current price so price has room to
+    # dip down INTO the zone. Otherwise we'd be "reclaiming" something we
+    # haven't yet dropped through.
+    below_zones = [z for z in strong_zones if z["high"] < current_price]
+    if not below_zones:
+        return None
+
+    # Pick the one with the highest center (nearest to current price from below)
+    nearest = max(below_zones, key=lambda z: z["center"])
+    return nearest
 
 
 # =====================================================
@@ -1011,6 +1257,186 @@ def check_and_trade(symbol, row, df, all_state):
             save_state(all_state)
             return
 
+    # =========================================================================
+    # PATH C — SUPPORT BOUNCE  (multi-TF pivot confluence)
+    # =========================================================================
+    # Two-stage logic:
+    #   Stage 1 (WAITING): If a zone is already armed, watch for the bounce.
+    #     - Track whether price has dipped INTO the zone (touched)
+    #     - Once touched, wait for a 15m close strictly above the zone upper edge
+    #     - On such a close → enter long
+    #     - Cancel the armed zone if:
+    #         • wait exceeds PATH_C_MAX_WAIT_BARS, OR
+    #         • price has fallen more than 2% below zone_low (zone broken)
+    #
+    #   Stage 2 (ARM): Otherwise, if conditions hold, arm a new zone:
+    #     - Drop from highest-EMA crossdown ≥ PATH_C_MIN_DROP_PCT
+    #     - Find nearest confluence support zone BELOW current price
+    #       (zone defended by ≥ MIN_TF_CONFLUENCE of 4 timeframes)
+    #     - Store it and wait for the bounce in a future scan
+    #
+    # This path is independent of trend_qualifies / cross_valid / slope — it
+    # operates purely on structural price levels across multiple timeframes.
+    # =========================================================================
+    if USE_PATH_C:
+        # ── STAGE 1: already armed — watch for bounce ──────────────────────
+        if st.get("path_c_armed"):
+            zone_low    = st.get("path_c_zone_low")
+            zone_high   = st.get("path_c_zone_high")
+            zone_center = st.get("path_c_zone_center")
+            armed_ts    = st.get("path_c_start_ts")
+
+            # Sanity: if any state missing, clear and continue
+            if None in (zone_low, zone_high, zone_center, armed_ts):
+                print(f"[PATH-C] {symbol} — incomplete armed state, clearing")
+                st["path_c_armed"] = False
+                save_state(all_state)
+            else:
+                bars_waiting = max(0, int((last_ts - armed_ts) // (CANDLE_SECONDS * 1000)))
+
+                # Zone-broken check: price traded well below zone (abandoned)
+                touch_margin     = zone_low * (1 - PATH_C_TOUCH_TOLERANCE_PCT / 100.0)
+                broken_threshold = zone_low * (1 - 2.0 / 100.0)  # 2% below zone_low = broken
+
+                # Mark "touched" if low dipped into or near the zone
+                if not st.get("path_c_zone_touched"):
+                    if last_low <= zone_high * (1 + PATH_C_TOUCH_TOLERANCE_PCT / 100.0) \
+                       and last_low >= touch_margin:
+                        st["path_c_zone_touched"] = True
+                        print(f"[PATH-C] {symbol} — zone TOUCHED at low {last_low} (zone {zone_low}–{zone_high})")
+
+                # Zone broken?
+                if last_close < broken_threshold:
+                    print(f"[PATH-C] {symbol} — zone BROKEN (close {last_close} < {broken_threshold:.6f}), cancelling")
+                    send_telegram(
+                        f"❌ <b>PATH C CANCELLED — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Close    : <code>{last_close}</code>\n"
+                        f"🧱 Zone     : <code>{round(zone_low, precision)} – {round(zone_high, precision)}</code>\n"
+                        f"⚠️ Reason   : zone broken (price fell &gt;2% below zone)"
+                    )
+                    st["path_c_armed"]        = False
+                    st["path_c_zone_low"]     = None
+                    st["path_c_zone_high"]    = None
+                    st["path_c_zone_center"]  = None
+                    st["path_c_zone_touched"] = False
+                    st["path_c_start_ts"]     = None
+                    st["path_c_tf_count"]     = None
+                    save_state(all_state)
+                    return
+
+                # Timeout?
+                if bars_waiting > PATH_C_MAX_WAIT_BARS:
+                    print(f"[PATH-C] {symbol} — wait timed out ({bars_waiting} > {PATH_C_MAX_WAIT_BARS})")
+                    st["path_c_armed"]        = False
+                    st["path_c_zone_low"]     = None
+                    st["path_c_zone_high"]    = None
+                    st["path_c_zone_center"]  = None
+                    st["path_c_zone_touched"] = False
+                    st["path_c_start_ts"]     = None
+                    st["path_c_tf_count"]     = None
+                    save_state(all_state)
+                    return
+
+                # Bounce confirmed?
+                reclaim_confirmed = (st.get("path_c_zone_touched")
+                                     and last_close > zone_high)
+
+                if reclaim_confirmed:
+                    print(f"[PATH-C] {symbol} — RECLAIM CONFIRMED close {last_close} > zone_high {zone_high}")
+
+                    # Final placement guards
+                    if get_position_by_pair(symbol) is not None:
+                        print(f"[ABORT] {symbol} — position appeared just before placement")
+                        return
+                    if has_open_order(symbol):
+                        print(f"[ABORT] {symbol} — order appeared just before placement")
+                        return
+
+                    entry_price = last_close
+                    tp_price    = entry_price * (1 + TP_PCT / 100)
+                    # SL for Path C: fixed % below zone_low (structural level).
+                    # Decoupled from SL_BELOW_EMA_PCT (which governs Paths A/B)
+                    # so Path C's SL stays anchored to the support band regardless
+                    # of any tuning applied to the EMA-based paths.
+                    sl_price    = zone_low * (1 - PATH_C_SL_BELOW_ZONE_PCT / 100)
+
+                    placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "support_bounce")
+                    if placed:
+                        st["path_c_armed"]        = False
+                        st["path_c_zone_low"]     = None
+                        st["path_c_zone_high"]    = None
+                        st["path_c_zone_center"]  = None
+                        st["path_c_zone_touched"] = False
+                        st["path_c_start_ts"]     = None
+                        st["path_c_tf_count"]     = None
+                        st["in_position"]         = True
+                        st["entry_path"]          = "support_bounce"
+                        st["entry_price"]         = round(entry_price, precision)
+                        st["tp_level"]            = round(tp_price,    precision)
+                        st["sl_price"]            = round(sl_price,    precision)
+                        update_sheet_tp(row, st["tp_level"])
+                        update_sheet_sl(row, st["sl_price"])
+
+                    save_state(all_state)
+                    return
+
+                # Still waiting
+                touched_str = "touched" if st.get("path_c_zone_touched") else "awaiting touch"
+                print(f"[PATH-C] {symbol} — waiting ({bars_waiting}/{PATH_C_MAX_WAIT_BARS}b, {touched_str}), "
+                      f"zone {round(zone_low, precision)}–{round(zone_high, precision)}, close {last_close}")
+                save_state(all_state)
+                return
+
+        # ── STAGE 2: not armed — evaluate whether to arm a new zone ────────
+        # Prereq: drop from highest-EMA crossdown ≥ PATH_C_MIN_DROP_PCT
+        # We already have drop_pct computed earlier. Path C uses a lower
+        # threshold (5%) than Path A/B's 10%.
+        path_c_drop_ok = drop_pct >= PATH_C_MIN_DROP_PCT
+
+        if path_c_drop_ok:
+            # Find the nearest confluence support zone below current price
+            zone = find_nearest_support_zone_below(symbol, last_close)
+
+            if zone is not None:
+                # Sanity: zone must actually be below current price by some margin
+                # (the check inside find_nearest_support_zone_below already enforces high < current_price,
+                # but we double-check here for safety)
+                if zone["high"] < last_close:
+                    tf_count   = len(zone["tfs"])
+                    tfs_str    = ",".join(sorted(zone["tfs"]))
+                    zone_low   = zone["low"]
+                    zone_high  = zone["high"]
+                    zone_cent  = zone["center"]
+                    dist_pct   = (last_close - zone_cent) / last_close * 100.0
+
+                    print(f"[PATH-C] {symbol} — ARMING zone {round(zone_low, precision)}–{round(zone_high, precision)} "
+                          f"(center {round(zone_cent, precision)}, {tf_count} TFs: {tfs_str}, "
+                          f"{round(dist_pct, 2)}% below close, drop {round(drop_pct, 2)}%)")
+
+                    st["path_c_armed"]        = True
+                    st["path_c_zone_low"]     = zone_low
+                    st["path_c_zone_high"]    = zone_high
+                    st["path_c_zone_center"]  = zone_cent
+                    st["path_c_zone_touched"] = False
+                    st["path_c_start_ts"]     = last_ts
+                    st["path_c_tf_count"]     = tf_count
+
+                    send_telegram(
+                        f"🟠 <b>PATH C ARMED (support bounce) — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 Close      : <code>{last_close}</code>\n"
+                        f"🧱 Zone low   : <code>{round(zone_low, precision)}</code>\n"
+                        f"🧱 Zone high  : <code>{round(zone_high, precision)}</code>\n"
+                        f"📊 Zone cent  : <code>{round(zone_cent, precision)}</code>\n"
+                        f"⏬ Dist below : <code>{round(dist_pct, 2)}%</code>\n"
+                        f"📉 Drop       : <code>{round(drop_pct, 2)}%</code>\n"
+                        f"🪢 Confluence : <code>{tf_count} TFs ({tfs_str})</code>\n"
+                        f"⌛ Waiting up to {PATH_C_MAX_WAIT_BARS} × 15m bars for bounce"
+                    )
+                    save_state(all_state)
+                    return
+
     # No action this cycle
     save_state(all_state)
 
@@ -1026,14 +1452,16 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy   : <code>200 EMA Dual-Path (Reversal + Breakout)</code>\n"
+    f"📐 Strategy   : <code>200 EMA Triple-Path (Reversal + Breakout + Support Bounce)</code>\n"
     f"⏱ Timeframe  : <code>15 Min (closed bars only)</code>\n"
     f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
     f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + drop≥{MIN_DROP_PCT}% when trend NOT qualifying</code>\n"
+    f"🆎 Path C    : <code>drop≥{PATH_C_MIN_DROP_PCT}% + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → wait bounce + 15m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
     f"📉 Drop       : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} bars must be ≥{MIN_DROP_PCT}%</code>\n"
+    f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: {', '.join(PATH_C_ENABLED_TIMEFRAMES)}m/h</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
-    f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%)</code>\n"
+    f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%) for Paths A/B, zone_low × (1 - {PATH_C_SL_BELOW_ZONE_PCT}%) for Path C</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 15 minutes..."
 )
