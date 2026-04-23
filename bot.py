@@ -18,25 +18,29 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 # STRATEGY PARAMETERS  (port of Pine Script "200 EMA Dual-Path Strategy")
 # Source: Long_Stratergy  (no trailing SL — fixed TP + fixed SL)
+#
+# TIMEFRAME ARCHITECTURE:
+#   - Primary analysis candles : 4h (EMA, slope, drop, crossover, trend)
+#   - Entry confirmation       : 30m (first 30m close that satisfies trigger)
+#   - Path C pivot confluence  : 4h + 12h (synthetic from 4h) + 1D
+#   - Scan interval            : 30 minutes
 # =============================================================================
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
-LOOKBACK             = 250      # candles to count below EMA
+LOOKBACK             = 200      # candles to count below EMA (was 150 on 15m, now 200 on 4h)
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
-TP_PCT               = 2.5      # Take Profit % (fixed above entry)
-SL_BELOW_EMA_PCT     = 0.8      # SL = EMA × (1 - this/100)
+TP_PCT               = 7.5      # Take Profit % (fixed above entry)
+SL_BELOW_EMA_PCT     = 5.0      # Paths A/B SL: EMA × (1 - this/100)  (was 1%, now 5%)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
-MAX_RETEST_BARS      = 20       # max 15m bars to wait for retest after arming
+MAX_RETEST_BARS      = 20       # max 4h bars to wait for retest after arming
 PROXIMITY_PCT        = 0.3      # retest zone = EMA × (1 + this/100)
 
 # ─── SLOPE FILTER ────────────────────────────────────────────────────────────
-# Pine: "Require EMA Flattening (Reversal)"  →  minEmaSlope = -0.2
-# Allows slight negative slope (flat/flattening EMA) — bullish early-reversal
 USE_SLOPE_FILTER     = True
 SLOPE_BARS           = 10       # % change of EMA over this many bars
-MIN_EMA_SLOPE_PCT    = 0.02     # min EMA slope % to qualify  (Pine default: -0.2)
+MIN_EMA_SLOPE_PCT    = -0.2     # min EMA slope % to qualify (Pine default: -0.2)
 
 # ─── VOLUME FILTER ───────────────────────────────────────────────────────────
 USE_VOLUME_FILTER    = True
@@ -49,79 +53,46 @@ USE_BREAKOUT_PATH    = True
 MOMENTUM_LOOKBACK    = 5        # close > close[N] bars ago
 
 # ─── CROSSOVER LOOKBACK (rescue filter) ──────────────────────────────────────
-# Pine strict: crossover must fire on the CURRENT bar.
-# Problem: if any other filter (slope/volume) happens to fail on the exact bar
-# the cross fires, the whole setup is discarded — even if it would have passed
-# on the very next bar. This causes many viable signals to be missed.
-# Fix: accept a cross that happened within the last N bars, PROVIDED price is
-# still above EMA and not overextended. All other filters (trend, slope, vol)
-# must still pass on the CURRENT bar, exactly as before.
-CROSS_LOOKBACK        = 5        # accept crossover from last N bars (incl. current)
-MAX_EMA_DISTANCE_PCT  = 1.5      # don't arm if price is already >X% above EMA (anti-chase)
+CROSS_LOOKBACK        = 5        # accept crossover from last N 4h bars (incl. current)
+MAX_EMA_DISTANCE_PCT  = 2.0      # don't arm if price is already >X% above EMA (anti-chase)
 
-# ─── CROSSDOWN DROP FILTER ───────────────────────────────────────────────────
-# Rejects coins that drifted below EMA without a real dump. The intent: only
-# trade reversals where the coin genuinely dropped, because those have room to
-# bounce. A coin that crossed down and sat there 2% below EMA is probably
-# ranging, not reversing.
-#
-# Algorithm (measures peak-to-trough dump magnitude):
-#   1. Scan the last DROP_LOOKBACK candles for ALL crossdowns
-#      (close went from ≥EMA → <EMA). Multiple are common in choppy periods.
-#   2a. One or more crossdowns FOUND:
-#         upper_hinge = MAX(EMA value at each crossdown bar)
-#                       (the "top of the damage" reference)
-#         lower       = LOWEST LOW across the entire DROP_LOOKBACK window
-#   2b. No crossdown (price was already below EMA throughout the window):
-#         upper_hinge = HIGHEST HIGH across the window
-#         lower       = LOWEST LOW across the window
-#   3. drop% = (upper_hinge - lower) / upper_hinge × 100
-#   4. Require drop% ≥ MIN_DROP_PCT
+# ─── CROSSDOWN DROP FILTER (Paths A/B) ──────────────────────────────────────
+# Used by Paths A/B only. Measures peak-to-trough dump magnitude using the
+# max-EMA across all crossdowns in the DROP_LOOKBACK window. ≥10% required.
 USE_DROP_FILTER      = True
-DROP_LOOKBACK        = 250       # candles to scan
+DROP_LOOKBACK        = 200       # matches LOOKBACK (same 4h window used throughout)
 MIN_DROP_PCT         = 10.0      # min drop % from upper hinge to lowest low
 
-# ─── PATH C: SUPPORT BOUNCE (multi-timeframe pivot confluence) ───────────────
-# Alternative long-entry path for coins that have dumped ≥5% from the top of
-# the EMA damage and are now heading toward a historically defended zone.
+# ─── PATH C: SUPPORT BOUNCE (multi-timeframe pivot confluence) ──────────────
+# Path C uses a LOWER timeframe regime than Paths A/B for pivot detection:
+#   - 4h   (resolution = "240")
+#   - 12h  (synthetic — built by merging 3 consecutive 4h candles)
+#   - 1D   (resolution = "1D")
 #
-# "Support zone" = a horizontal price band where price previously reversed
-# direction — this includes both pivot HIGHS (prior resistance that may flip
-# to support) and pivot LOWS (prior bounce levels). Any bar that was a local
-# extreme counts as a reactive level.
-#
-# Confluence across 4 timeframes (15m / 30m / 1h / 4h) identifies zones that
-# matter on multiple scales — a single 15m pivot is noise, but a zone where
-# 3 of 4 timeframes have pivots is a meaningful structural level.
-#
-# Flow:
-#   1. Coin dumped ≥PATH_C_MIN_DROP_PCT from the MOST RECENT crossdown
-#      (uses a different drop measurement than Paths A/B, which use max-EMA).
-#      Fallback: if no crossdown in window, reuse the general drop_pct
-#      (max-EMA / highest-high based).
-#   2. Find all pivots (highs + lows) in 600-bar windows on each of 4 TFs
-#   3. Cluster pivots that fall within PIVOT_ZONE_PCT of each other into zones
-#   4. Keep only zones defended by ≥MIN_TF_CONFLUENCE timeframes
-#   5. Filter to zones BELOW current price → price is expected to find support here
-#   6. Pick the NEAREST zone below current price (the first floor the coin will test)
-#   7. Arm the setup and wait for a bounce: a 15m bar closes above the zone
-#      AFTER price has traded at or below the zone center
-#   8. Enter long on the reclaim bar
+# NOTE on 12h: CoinDCX's futures candlestick endpoint doesn't document a
+# native 12h / 720-minute resolution. To avoid silent API failures, we
+# construct 12h candles synthetically from 4h data (every 3 × 4h = 12h).
+# This guarantees correct OHLCV regardless of what resolutions CoinDCX
+# accepts in a given API version.
 USE_PATH_C                = True
-PATH_C_ENABLED_TIMEFRAMES = ["15", "30", "60", "240"]  # CoinDCX resolution strings
-PATH_C_CANDLES            = 600           # bars per TF
-PATH_C_MIN_DROP_PCT       = 7.0           # min drop from MOST RECENT crossdown
+PATH_C_ENABLED_TIMEFRAMES = ["240", "12H_synth", "1D"]   # 4h + synthetic 12h + 1D
+PATH_C_CANDLES            = 600           # target bars per TF (12H_synth derives from 4h, so fetches 3×)
+PATH_C_MIN_DROP_PCT       = 5.0           # min drop from MOST RECENT crossdown (4h-based)
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
 PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
-MIN_TF_CONFLUENCE         = 3             # minimum TFs defending a zone (3 of 4)
-PATH_C_MAX_WAIT_BARS      = 30            # max 15m bars to wait for bounce after arming
+MIN_TF_CONFLUENCE         = 2             # min TFs defending a zone (2 of 3 for relaxed mode)
+PATH_C_MAX_WAIT_BARS      = 30            # max 30m bars to wait for bounce (uses 30m since that's entry TF)
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
-PATH_C_SL_BELOW_ZONE_PCT  = 0.8           # SL placed this % below zone_low (Path C only, decoupled from Paths A/B)
+PATH_C_SL_BELOW_ZONE_PCT  = 2.0           # Path C SL: zone_low × (1 - this/100)  (was 1%, now 2%)
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
-RESOLUTION           = "15"     # CoinDCX 15-minute candles
-CANDLE_SECONDS       = 15 * 60
-SCAN_INTERVAL        = 900      # 15 minutes in seconds
+# Primary analysis is on 4h. Entry confirmation is on 30m.
+# Scan interval = 30 min so we react to every 30m close.
+RESOLUTION_PRIMARY   = "240"    # CoinDCX 4-hour candles (was "15")
+RESOLUTION_ENTRY     = "30"     # CoinDCX 30-minute candles for entry confirmation
+CANDLE_SECONDS       = 4 * 3600 # primary candle length (4h, was 15m)
+ENTRY_CANDLE_SECONDS = 30 * 60  # entry candle length (30m)
+SCAN_INTERVAL        = 1800     # 30 minutes (was 900 = 15 min)
 
 # ─── REQUEST TIMEOUTS (seconds) ──────────────────────────────────────────────
 REQUEST_TIMEOUT      = 15
@@ -365,21 +336,30 @@ def had_recent_crossup(closes, emas, lookback):
 
 
 # =====================================================
-# CANDLE FETCH (15-minute resolution)
+# CANDLE FETCH (primary: 4h; entry confirmation: 30m)
 # =====================================================
 
-def fetch_candles(symbol, num_candles_needed):
+def fetch_candles(symbol, num_candles_needed, resolution_str=None, candle_seconds=None):
+    """
+    Primary candle fetch. Defaults to RESOLUTION_PRIMARY (4h) but accepts
+    overrides for the 30m entry-confirmation fetch.
+    """
+    if resolution_str is None:
+        resolution_str = RESOLUTION_PRIMARY
+    if candle_seconds is None:
+        candle_seconds = CANDLE_SECONDS
+
     pair_api = fut_pair(symbol)
     url      = "https://public.coindcx.com/market_data/candlesticks"
     now      = int(time.time())
     # +50 as safety buffer
-    fetch_seconds = (num_candles_needed + 50) * CANDLE_SECONDS
+    fetch_seconds = (num_candles_needed + 50) * candle_seconds
 
     params = {
         "pair":       pair_api,
         "from":       now - fetch_seconds,
         "to":         now,
-        "resolution": RESOLUTION,
+        "resolution": resolution_str,
         "pcode":      "f",
     }
     try:
@@ -388,15 +368,27 @@ def fetch_candles(symbol, num_candles_needed):
         candles  = sorted(data, key=lambda x: x["time"])
         return candles
     except Exception as e:
-        print(f"[CANDLES] {symbol} fetch error: {e}")
+        print(f"[CANDLES {resolution_str}] {symbol} fetch error: {e}")
         return []
 
 
 def fetch_candles_tf(symbol, resolution_str, num_candles_needed):
     """
-    Generic multi-timeframe candle fetch. `resolution_str` must be a CoinDCX
-    resolution: "15", "30", "60", "240", "1D". Returns a list of dicts with
-    keys: time, open, high, low, close, volume.
+    Multi-timeframe candle fetch supporting both native CoinDCX resolutions
+    and synthetic aggregated resolutions.
+
+    Supported native: "1", "5", "15", "30", "60", "240", "1D"
+    Supported synthetic: "12H_synth" (built from 3 × 4h candles)
+
+    Synthetic 12h is needed because CoinDCX's futures candlesticks endpoint
+    doesn't document a 12h / 720-minute resolution. Rather than risk a silent
+    API failure on "720", we construct 12h OHLCV from 4h data deterministically:
+        12h_open   = first 4h open in the group
+        12h_close  = last 4h close in the group
+        12h_high   = max of 3 × 4h highs
+        12h_low    = min of 3 × 4h lows
+        12h_volume = sum of 3 × 4h volumes
+        12h_time   = timestamp of the first 4h candle in the group
     """
     # Map resolution string to seconds per candle
     res_to_seconds = {
@@ -408,6 +400,35 @@ def fetch_candles_tf(symbol, resolution_str, num_candles_needed):
         "240":  4  * 60 * 60,
         "1D":   24 * 60 * 60,
     }
+
+    # ── Synthetic 12h: build from 3 × 4h candles ──────────────────────────
+    if resolution_str == "12H_synth":
+        # Need 3× as many 4h candles
+        needed_4h = num_candles_needed * 3 + 10
+        candles_4h = fetch_candles_tf(symbol, "240", needed_4h)
+        if len(candles_4h) < 3:
+            return []
+
+        # Group chronologically into chunks of 3
+        synthetic = []
+        for i in range(0, len(candles_4h) - 2, 3):
+            group = candles_4h[i:i + 3]
+            if len(group) != 3:
+                continue
+            synthetic.append({
+                "time":   int(group[0]["time"]),
+                "open":   float(group[0]["open"]),
+                "high":   max(float(c["high"])   for c in group),
+                "low":    min(float(c["low"])    for c in group),
+                "close":  float(group[-1]["close"]),
+                "volume": sum(float(c.get("volume", 0)) for c in group),
+            })
+        # Trim to requested count (newest N)
+        if len(synthetic) > num_candles_needed:
+            synthetic = synthetic[-num_candles_needed:]
+        return synthetic
+
+    # ── Native resolutions ────────────────────────────────────────────────
     seconds_per_candle = res_to_seconds.get(resolution_str, CANDLE_SECONDS)
 
     pair_api = fut_pair(symbol)
@@ -592,6 +613,84 @@ def find_nearest_support_zone_below(symbol, current_price):
     # Pick the one with the highest center (nearest to current price from below)
     nearest = max(below_zones, key=lambda z: z["center"])
     return nearest
+
+
+# =====================================================
+# 30-MINUTE ENTRY CONFIRMATION HELPERS
+# =====================================================
+# Architecture: Paths A/B/C all QUALIFY on 4h candles but TRIGGER on 30m.
+# Each helper fetches a small window of recent 30m candles and checks whether
+# any CLOSED 30m bar satisfies the trigger condition. If yes, returns the
+# trigger bar so the bot can use its close as entry_price.
+
+def _fetch_closed_30m_candles(symbol, num_candles=6):
+    """
+    Fetch the last N closed 30m candles. Drops the in-progress bar if any.
+    """
+    candles = fetch_candles(symbol, num_candles + 2, RESOLUTION_ENTRY, ENTRY_CANDLE_SECONDS)
+    if not candles:
+        return []
+    # Drop in-progress bar: if last candle has elapsed < 30 min, discard it
+    now_ms = int(time.time() * 1000)
+    if len(candles) >= 1:
+        last_ts_ms = int(candles[-1]["time"])
+        elapsed_ms = now_ms - last_ts_ms
+        if elapsed_ms < ENTRY_CANDLE_SECONDS * 1000:
+            candles = candles[:-1]
+    return candles
+
+
+def confirm_30m_close_above(symbol, level):
+    """
+    Returns the first CLOSED 30m candle (most-recent) whose close is > level,
+    or None if none in the lookback window. Use this for:
+      - Path A retest trigger: close above EMA after a dip
+      - Path B breakout trigger: close above EMA
+      - Path C reclaim trigger: close above zone_high after a zone touch
+    """
+    candles = _fetch_closed_30m_candles(symbol, 6)
+    if not candles:
+        return None
+    # Check the most recent closed candle first (most relevant)
+    last = candles[-1]
+    if float(last["close"]) > level:
+        return last
+    return None
+
+
+def confirm_30m_touch_and_close_above(symbol, zone_low, zone_high,
+                                       touch_tolerance_pct=None):
+    """
+    Path C variant: requires the SAME 30m bar (or one earlier bar within the
+    short window) to have dipped low enough to "touch" the zone, followed by
+    a CLOSE above zone_high. Returns the confirming 30m bar or None.
+
+    In practice we check: over the last 6 × 30m candles (3 hours), did at
+    least one bar's low drop into the zone, AND does the current closed 30m
+    bar close above zone_high?
+    """
+    if touch_tolerance_pct is None:
+        touch_tolerance_pct = PATH_C_TOUCH_TOLERANCE_PCT
+
+    candles = _fetch_closed_30m_candles(symbol, 6)
+    if not candles:
+        return None
+
+    last = candles[-1]
+    last_close = float(last["close"])
+
+    # Current 30m close must be strictly above zone_high
+    if last_close <= zone_high:
+        return None
+
+    # At least one of the last few 30m bars must have wicked into the zone
+    touch_ceiling = zone_high * (1 + touch_tolerance_pct / 100.0)
+    touch_floor   = zone_low  * (1 - touch_tolerance_pct / 100.0)
+    for c in candles:
+        c_low = float(c["low"])
+        if touch_floor <= c_low <= touch_ceiling:
+            return last
+    return None
 
 
 # =====================================================
@@ -802,9 +901,12 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
 def check_and_trade(symbol, row, df, all_state):
     pair = fut_pair(symbol)
 
-    # ─── Fetch enough 15m candles ────────────────────────────────────────────
+    # ─── Fetch enough 4h candles (primary TF) ────────────────────────────────
+    # Need EMA_PERIOD (200) to compute EMA + LOOKBACK (200) for below% trend
+    # test + a safety margin. With 430 × 4h candles we cover ~72 days which is
+    # plenty for the EMA to stabilize and for the trend filter to be meaningful.
     candles_needed = EMA_PERIOD + LOOKBACK + 30
-    candles = fetch_candles(symbol, candles_needed)
+    candles = fetch_candles(symbol, candles_needed)   # defaults to RESOLUTION_PRIMARY (4h)
 
     if len(candles) < EMA_PERIOD + LOOKBACK + 5:
         print(f"[SKIP] {symbol} — insufficient candles ({len(candles)})")
@@ -1175,13 +1277,25 @@ def check_and_trade(symbol, row, df, all_state):
                 save_state(all_state)
                 return
 
-            # Retest confirmed: low dipped into proximity zone AND close stayed above EMA
-            retest_confirmed = (bars_waiting >= 1
+            # Retest qualification: a 4h bar's low has dipped into proximity AND
+            # its close stayed above EMA. This is the 4h-side qualification.
+            retest_qualified = (bars_waiting >= 1
                                 and last_low <= proximity_level
                                 and last_close > ema_now)
 
-            if retest_confirmed:
-                print(f"[RETEST CONFIRMED] {symbol} — entering long (Path A)")
+            if retest_qualified:
+                # 30m ENTRY CONFIRMATION: the actual entry trigger runs on 30m.
+                # Require a closed 30m candle that closes above the EMA level.
+                # (Using current 4h ema_now as the reference — EMA doesn't change
+                #  between consecutive 30m bars within the same 4h bar.)
+                confirm_bar = confirm_30m_close_above(symbol, ema_now)
+
+                if confirm_bar is None:
+                    print(f"[PATH A] {symbol} — 4h retest qualified, awaiting 30m close above EMA")
+                    save_state(all_state)
+                    return
+
+                print(f"[RETEST CONFIRMED] {symbol} — 4h qualified + 30m close {confirm_bar['close']} > EMA (Path A)")
 
                 # Final guard
                 if get_position_by_pair(symbol) is not None:
@@ -1191,7 +1305,8 @@ def check_and_trade(symbol, row, df, all_state):
                     print(f"[ABORT] {symbol} — order appeared just before placement")
                     return
 
-                entry_price = last_close
+                # Entry price: the 30m confirmation bar's close
+                entry_price = float(confirm_bar["close"])
                 tp_price    = entry_price * (1 + TP_PCT / 100)
                 sl_price    = ema_now     * (1 - SL_BELOW_EMA_PCT / 100)
 
@@ -1269,14 +1384,22 @@ def check_and_trade(symbol, row, df, all_state):
     # when the cross is rescued, so we don't re-check those here.
     # =========================================================================
     if USE_BREAKOUT_PATH:
-        breakout_entry = ((not trend_qualifies)
-                          and cross_valid
-                          and price_rising
-                          and breakout_vol_ok
-                          and drop_ok)
-        if breakout_entry:
+        breakout_qualified = ((not trend_qualifies)
+                              and cross_valid
+                              and price_rising
+                              and breakout_vol_ok
+                              and drop_ok)
+        if breakout_qualified:
             cross_detail = "strict" if cross_up_strict else f"rescued ({cross_bars_ago}b ago)"
-            print(f"[BREAKOUT] {symbol} — entering long (Path B, cross:{cross_detail}, drop:{round(drop_pct, 2)}%)")
+
+            # 30m ENTRY CONFIRMATION — require a 30m close above EMA
+            confirm_bar = confirm_30m_close_above(symbol, ema_now)
+            if confirm_bar is None:
+                print(f"[BREAKOUT] {symbol} — 4h qualified (cross:{cross_detail}, drop:{round(drop_pct, 2)}%), awaiting 30m close above EMA")
+                save_state(all_state)
+                return
+
+            print(f"[BREAKOUT] {symbol} — 4h qualified + 30m close {confirm_bar['close']} > EMA (Path B, cross:{cross_detail}, drop:{round(drop_pct, 2)}%)")
 
             # Final guard
             if get_position_by_pair(symbol) is not None:
@@ -1286,7 +1409,8 @@ def check_and_trade(symbol, row, df, all_state):
                 print(f"[ABORT] {symbol} — order appeared just before placement")
                 return
 
-            entry_price = last_close
+            # Entry price: the 30m confirmation bar's close
+            entry_price = float(confirm_bar["close"])
             tp_price    = entry_price * (1 + TP_PCT / 100)
             sl_price    = ema_now     * (1 - SL_BELOW_EMA_PCT / 100)
 
@@ -1386,12 +1510,15 @@ def check_and_trade(symbol, row, df, all_state):
                     save_state(all_state)
                     return
 
-                # Bounce confirmed?
-                reclaim_confirmed = (st.get("path_c_zone_touched")
-                                     and last_close > zone_high)
+                # Bounce confirmed on 30m?
+                # Path C reclaim trigger uses the confirm_30m_touch_and_close_above
+                # helper which checks BOTH that a recent 30m bar touched the zone
+                # AND the current 30m closed above zone_high.
+                confirm_bar = confirm_30m_touch_and_close_above(symbol, zone_low, zone_high)
 
-                if reclaim_confirmed:
-                    print(f"[PATH-C] {symbol} — RECLAIM CONFIRMED close {last_close} > zone_high {zone_high}")
+                if confirm_bar is not None:
+                    entry_price_30m = float(confirm_bar["close"])
+                    print(f"[PATH-C] {symbol} — RECLAIM CONFIRMED on 30m close {entry_price_30m} > zone_high {zone_high}")
 
                     # Final placement guards
                     if get_position_by_pair(symbol) is not None:
@@ -1401,7 +1528,7 @@ def check_and_trade(symbol, row, df, all_state):
                         print(f"[ABORT] {symbol} — order appeared just before placement")
                         return
 
-                    entry_price = last_close
+                    entry_price = entry_price_30m
                     tp_price    = entry_price * (1 + TP_PCT / 100)
                     # SL for Path C: fixed % below zone_low (structural level).
                     # Decoupled from SL_BELOW_EMA_PCT (which governs Paths A/B)
@@ -1502,17 +1629,18 @@ send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy   : <code>200 EMA Triple-Path (Reversal + Breakout + Support Bounce)</code>\n"
-    f"⏱ Timeframe  : <code>15 Min (closed bars only)</code>\n"
-    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} bars)</code>\n"
+    f"⏱ Analysis   : <code>4h primary (closed bars only)</code>\n"
+    f"⚡ Entry      : <code>30m close confirmation (all paths)</code>\n"
+    f"🔁 Scan       : <code>Every 30 minutes</code>\n"
+    f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} × 4h bars)</code>\n"
     f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + drop≥{MIN_DROP_PCT}% when trend NOT qualifying</code>\n"
-    f"🆎 Path C    : <code>drop≥{PATH_C_MIN_DROP_PCT}% (from most-recent crossdown) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → wait bounce + 15m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
+    f"🆎 Path C    : <code>drop≥{PATH_C_MIN_DROP_PCT}% (from recent crossdown, current leg only) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
-    f"📉 Drop       : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} bars must be ≥{MIN_DROP_PCT}%</code>\n"
-    f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: {', '.join(PATH_C_ENABLED_TIMEFRAMES)}m/h</code>\n"
+    f"📉 Drop A/B   : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} × 4h bars must be ≥{MIN_DROP_PCT}%</code>\n"
+    f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
-    f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%) for Paths A/B, zone_low × (1 - {PATH_C_SL_BELOW_ZONE_PCT}%) for Path C</code>\n"
-    f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
-    f"🕐 Scanning every 15 minutes..."
+    f"🛑 SL         : <code>EMA × (1 - {SL_BELOW_EMA_PCT}%) for Paths A/B  •  zone_low × (1 - {PATH_C_SL_BELOW_ZONE_PCT}%) for Path C</code>\n"
+    f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
 while True:
