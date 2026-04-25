@@ -30,7 +30,7 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD           = 200
 LOOKBACK             = 200      # candles to count below EMA (was 150 on 15m, now 200 on 4h)
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
-TP_PCT               = 5     # Take Profit % (fixed above entry)
+TP_PCT               = 2.5     # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 5.0      # Paths A/B SL: EMA × (1 - this/100)  (was 1%, now 5%)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
