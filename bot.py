@@ -30,7 +30,7 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD           = 200
 LOOKBACK             = 200      # candles to count below EMA (was 150 on 15m, now 200 on 4h)
 BELOW_PCT_MIN        = 70.0     # min % of last LOOKBACK candles below EMA
-TP_PCT               = 2.5     # Take Profit % (fixed above entry)
+TP_PCT               = 5     # Take Profit % (fixed above entry)
 SL_BELOW_EMA_PCT     = 5.0      # Paths A/B SL: EMA × (1 - this/100)  (was 1%, now 5%)
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
@@ -761,25 +761,40 @@ def get_position_by_pair(symbol):
 
 
 def has_open_order(symbol):
-    """Entry-type unfilled order still on book."""
+    """
+    Returns True if there is an unfilled BUY entry order on the book for this
+    pair (status: open or partially_filled).
+
+    Per CoinDCX List Orders API:
+      - timestamp: int (epoch ms)
+      - status:    string, comma-separated  (NOT array)
+      - side:      string, mandatory
+      - page:      string  (NOT int)
+      - size:      string  (NOT int)
+      - margin_currency_short_name: array  (NOT string)
+    """
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
-            "page":                       1,
-            "size":                       50,
-            "margin_currency_short_name": "USDT",
-            "status":                     ["initial", "open", "partially_filled"],
+            "status":                     "open,partially_filled",
+            "side":                       "buy",
+            "page":                       "1",
+            "size":                       "50",
+            "margin_currency_short_name": ["USDT"],
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         orders   = response.json()
 
+        if not isinstance(orders, list):
+            print(f"[has_open_order] {symbol} unexpected response (request rejected?): {orders}")
+            return False
+
         pair = fut_pair(symbol)
-        if isinstance(orders, list):
-            for o in orders:
-                if o.get("pair") == pair:
-                    return True
+        for o in orders:
+            if o.get("pair") == pair:
+                return True
         return False
 
     except Exception as e:
