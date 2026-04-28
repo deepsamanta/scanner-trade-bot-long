@@ -67,6 +67,9 @@ MIN_DROP_PCT         = 10.0
 USE_PATH_C                 = True
 PATH_C_ABOVE_EMA_MAX_PCT   = 4.0          # above EMA → must be within 4%
 PATH_C_BELOW_EMA_MIN_PCT   = 8.0          # below EMA → must be 8% or more
+PATH_C_ABOVE_ZONE_BUFFER_PCT = 1.0        # above-EMA case: zone_low must be ≥ ema × (1 + this/100)
+PATH_C_SPIKE_LOOKBACK_BARS = 30           # above-EMA case: scan last N × 4h bars for blow-off top
+PATH_C_SPIKE_REJECT_PCT    = 8.0          # above-EMA case: reject if any 4h high in window ≥ this% above current close
 PATH_C_ENABLED_TIMEFRAMES  = ["240", "12H_synth", "1D"]
 PATH_C_CANDLES             = 600
 PIVOT_STRENGTH             = 3
@@ -1253,7 +1256,42 @@ def check_and_trade(symbol, row, df, all_state):
             gate_reason = ("above_ema_within_4pct" if above_within
                            else "below_ema_by_8pct_plus")
 
+            # Above-EMA blow-off-top filter:
+            # If any 4h high in the last PATH_C_SPIKE_LOOKBACK_BARS bars sat
+            # ≥ PATH_C_SPIKE_REJECT_PCT above the CURRENT close, price has
+            # already spiked and is now pulling back. Such pullbacks toward
+            # EMA usually break through it rather than bouncing — skip arm.
+            # Below-EMA case is unaffected.
+            spike_rejected = False
+            if above_within:
+                spike_window = highs[-PATH_C_SPIKE_LOOKBACK_BARS:] \
+                    if len(highs) >= PATH_C_SPIKE_LOOKBACK_BARS else highs
+                if spike_window:
+                    peak_high = max(spike_window)
+                    spike_pct = ((peak_high - last_close) / last_close * 100.0) if last_close else 0
+                    if spike_pct >= PATH_C_SPIKE_REJECT_PCT:
+                        print(f"[PATH-C] {symbol} — above-EMA arm rejected: peak high {peak_high:.6f} "
+                              f"is {spike_pct:.2f}% above close {last_close} (≥{PATH_C_SPIKE_REJECT_PCT}% "
+                              f"in last {PATH_C_SPIKE_LOOKBACK_BARS} × 4h bars) — likely fading")
+                        spike_rejected = True
+
+            if spike_rejected:
+                save_state(all_state)
+                return
+
             zone = find_nearest_support_zone_below(symbol, last_close)
+
+            # Above-EMA fakeout filter: when arming on the "price above EMA"
+            # side, require the zone's LOWER edge to sit at least
+            # PATH_C_ABOVE_ZONE_BUFFER_PCT above the EMA. This keeps the zone
+            # safely above EMA so a wick through EMA doesn't falsely touch it.
+            # Below-EMA case is unaffected — those zones are deep already.
+            if zone is not None and above_within:
+                min_zone_low = ema_now * (1 + PATH_C_ABOVE_ZONE_BUFFER_PCT / 100.0)
+                if zone["low"] < min_zone_low:
+                    print(f"[PATH-C] {symbol} — zone rejected (above-EMA case): zone_low {zone['low']:.6f} "
+                          f"< required {min_zone_low:.6f} (ema {ema_now:.6f} × 1.0{int(PATH_C_ABOVE_ZONE_BUFFER_PCT)})")
+                    zone = None
 
             if zone is not None and zone["high"] < last_close:
                 tf_count   = len(zone["tfs"])
@@ -1314,7 +1352,7 @@ send_telegram(
     f"🔁 Scan       : <code>Every 30 minutes</code>\n"
     f"🅰️ Path A    : <code>{BELOW_PCT_MIN}% below EMA + cross + slope≥{MIN_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + drop≥{MIN_DROP_PCT}% → wait retest (≤{MAX_RETEST_BARS} × 4h bars)</code>\n"
     f"🅱️ Path B    : <code>cross + close&gt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKOUT_VOL_MULT} + drop≥{MIN_DROP_PCT}% when trend NOT qualifying</code>\n"
-    f"🆎 Path C    : <code>(price above EMA ≤{PATH_C_ABOVE_EMA_MAX_PCT}% OR below EMA ≥{PATH_C_BELOW_EMA_MIN_PCT}%) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
+    f"🆎 Path C    : <code>(price above EMA ≤{PATH_C_ABOVE_EMA_MAX_PCT}% with zone_low ≥ EMA+{PATH_C_ABOVE_ZONE_BUFFER_PCT}% AND no peak ≥{PATH_C_SPIKE_REJECT_PCT}% above close in last {PATH_C_SPIKE_LOOKBACK_BARS} × 4h bars OR below EMA ≥{PATH_C_BELOW_EMA_MIN_PCT}%) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still above EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
     f"📉 Drop A/B   : <code>max-EMA across all crossdowns (or highest-high if never crossed) → lowest-low across last {DROP_LOOKBACK} × 4h bars must be ≥{MIN_DROP_PCT}%</code>\n"
     f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D</code>\n"
