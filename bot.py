@@ -29,8 +29,8 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD           = 200
 LOOKBACK             = 200
 BELOW_PCT_MIN        = 70.0
-TP_PCT               = 5
-SL_BELOW_EMA_PCT     = 5.0
+TP_PCT               = 2
+SL_BELOW_EMA_PCT     = 2
 
 # ─── PATH A: REVERSAL RETEST ─────────────────────────────────────────────────
 MAX_RETEST_BARS      = 20
@@ -65,8 +65,8 @@ MIN_DROP_PCT         = 10.0
 #   Case 1 — price ABOVE EMA and within PATH_C_ABOVE_EMA_MAX_PCT
 #   Case 2 — price BELOW EMA by at least PATH_C_BELOW_EMA_MIN_PCT
 USE_PATH_C                 = True
-PATH_C_ABOVE_EMA_MAX_PCT   = 4.0          # above EMA → must be within 4%
-PATH_C_BELOW_EMA_MIN_PCT   = 8.0          # below EMA → must be 8% or more
+PATH_C_ABOVE_EMA_MAX_PCT   = 5.0          # above EMA → must be within 4%
+PATH_C_BELOW_EMA_MIN_PCT   = 9.0          # below EMA → must be 8% or more
 PATH_C_ABOVE_ZONE_BUFFER_PCT = 1.0        # above-EMA case: zone_low must be ≥ ema × (1 + this/100)
 PATH_C_SPIKE_LOOKBACK_BARS = 30           # above-EMA case: scan last N × 4h bars for blow-off top
 PATH_C_SPIKE_REJECT_PCT    = 8.0          # above-EMA case: reject if any 4h high in window ≥ this% above current close
@@ -77,7 +77,7 @@ PIVOT_ZONE_PCT             = 1.0
 MIN_TF_CONFLUENCE          = 2
 PATH_C_MAX_WAIT_BARS       = 30
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5
-PATH_C_SL_BELOW_ZONE_PCT   = 2.0
+PATH_C_SL_BELOW_ZONE_PCT   = 1.0
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY   = "240"
