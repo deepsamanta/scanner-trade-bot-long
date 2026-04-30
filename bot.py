@@ -36,7 +36,7 @@ TP_PCT               = 5
 #   Case 2 — price BELOW EMA by at least PATH_C_BELOW_EMA_MIN_PCT
 #            → support zone below price (any level)
 PATH_C_ABOVE_EMA_MAX_PCT   = 4.0
-PATH_C_BELOW_EMA_MIN_PCT   = 8.0
+PATH_C_BELOW_EMA_MIN_PCT   = 10.0
 PATH_C_ENABLED_TIMEFRAMES  = ["240", "12H_synth", "1D", "3D_synth"]
 PATH_C_CANDLES             = 1000
 PIVOT_STRENGTH             = 3
