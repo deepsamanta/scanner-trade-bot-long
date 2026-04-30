@@ -36,8 +36,8 @@ TP_PCT               = 5
 #   Case 2 — price BELOW EMA by at least PATH_C_BELOW_EMA_MIN_PCT
 #            → support zone below price (any level)
 PATH_C_ABOVE_EMA_MAX_PCT   = 4.0
-PATH_C_BELOW_EMA_MIN_PCT   = 10.0
-PATH_C_ENABLED_TIMEFRAMES  = ["240", "12H_synth", "1D", "1W"]
+PATH_C_BELOW_EMA_MIN_PCT   = 8.0
+PATH_C_ENABLED_TIMEFRAMES  = ["240", "12H_synth", "1D", "3D_synth"]
 PATH_C_CANDLES             = 1000
 PIVOT_STRENGTH             = 3
 PIVOT_ZONE_PCT             = 1.0
@@ -292,19 +292,25 @@ def fetch_candles_tf(symbol, resolution_str, num_candles_needed):
         "60":   60 * 60,
         "240":  4  * 60 * 60,
         "1D":   24 * 60 * 60,
-        "1W":   7  * 24 * 60 * 60,
     }
 
-    if resolution_str == "12H_synth":
-        needed_4h = num_candles_needed * 3 + 10
-        candles_4h = fetch_candles_tf(symbol, "240", needed_4h)
-        if len(candles_4h) < 3:
+    # Synthetic timeframes built by grouping smaller candles
+    SYNTH_SPECS = {
+        "12H_synth": ("240", 3),  # 3 × 4h  = 12h
+        "3D_synth":  ("1D",  3),  # 3 × 1D  = 3D
+    }
+
+    if resolution_str in SYNTH_SPECS:
+        base_res, group_size = SYNTH_SPECS[resolution_str]
+        needed_base = num_candles_needed * group_size + 10
+        base_candles = fetch_candles_tf(symbol, base_res, needed_base)
+        if len(base_candles) < group_size:
             return []
 
         synthetic = []
-        for i in range(0, len(candles_4h) - 2, 3):
-            group = candles_4h[i:i + 3]
-            if len(group) != 3:
+        for i in range(0, len(base_candles) - (group_size - 1), group_size):
+            group = base_candles[i:i + group_size]
+            if len(group) != group_size:
                 continue
             synthetic.append({
                 "time":   int(group[0]["time"]),
@@ -996,7 +1002,7 @@ send_telegram(
     f"🔁 Scan       : <code>Every 30 minutes</code>\n"
     f"🆎 Path C    : <code>(price above EMA ≤{PATH_C_ABOVE_EMA_MAX_PCT}% OR below EMA ≥{PATH_C_BELOW_EMA_MIN_PCT}%) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"⚠️ Above-EMA  : <code>support zone must sit ABOVE the EMA when price is within {PATH_C_ABOVE_EMA_MAX_PCT}% above</code>\n"
-    f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D + 1W, {PATH_C_CANDLES} candles each</code>\n"
+    f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D + 3D synth, {PATH_C_CANDLES} candles each</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
     f"🛑 SL         : <code>zone_low × (1 - {PATH_C_SL_BELOW_ZONE_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
