@@ -27,7 +27,15 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
+EMA_FAST_PERIOD      = 21
 TP_PCT               = 5
+
+# ─── EMA21 RESISTANCE FILTER (Path C) ────────────────────────────────────────
+# If 4h EMA21 sits just above the support zone (within this %), skip arming —
+# EMA21 would likely act as resistance on the bounce. Wait for price to reclaim
+# EMA21 (close > EMA21 on 4h) before arming on this support.
+USE_EMA21_RESISTANCE_FILTER = True
+EMA21_RESISTANCE_MAX_PCT    = 1.3
 
 # ─── PATH C: SUPPORT BOUNCE (multi-timeframe pivot confluence) ──────────────
 # Activation gate (4h EMA distance, signed):
@@ -36,7 +44,7 @@ TP_PCT               = 5
 #   Case 2 — price BELOW EMA by at least PATH_C_BELOW_EMA_MIN_PCT
 #            → support zone below price (any level)
 PATH_C_ABOVE_EMA_MAX_PCT   = 4.0
-PATH_C_BELOW_EMA_MIN_PCT   = 10.0
+PATH_C_BELOW_EMA_MIN_PCT   = 8.0
 PATH_C_ENABLED_TIMEFRAMES  = ["240", "12H_synth", "1D", "3D_synth"]
 PATH_C_CANDLES             = 1000
 PIVOT_STRENGTH             = 3
@@ -730,11 +738,14 @@ def check_and_trade(symbol, row, df, all_state):
 
     ema_values = compute_ema(closes, EMA_PERIOD)
     if ema_values[-1] is None:
-        print(f"[SKIP] {symbol} — EMA not ready")
+        print(f"[SKIP] {symbol} — EMA200 not ready")
         return
 
     ema_now = ema_values[-1]
     ema_distance_pct = ((last_close - ema_now) / ema_now * 100.0) if ema_now else 0
+
+    ema21_values = compute_ema(closes, EMA_FAST_PERIOD)
+    ema21_now    = ema21_values[-1] if ema21_values[-1] is not None else None
 
     # Per-symbol state
     st = all_state.get(symbol)
@@ -831,6 +842,7 @@ def check_and_trade(symbol, row, df, all_state):
     # =========================================================================
     print(
         f"[SCAN] {symbol} | close={last_close} ema200={round(ema_now, precision)} | "
+        f"ema21={round(ema21_now, precision) if ema21_now else 'n/a'} | "
         f"distEMA={round(ema_distance_pct, 2)}% | "
         f"pathC_armed={st.get('path_c_armed', False)}"
     )
@@ -947,6 +959,24 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
+    # EMA21 resistance filter: if 4h EMA21 sits just above zone_high (within 1.3%)
+    # AND price has not yet reclaimed EMA21, skip arming — EMA21 would act as
+    # resistance on the bounce. Wait for reclaim, then re-evaluate next scan.
+    if USE_EMA21_RESISTANCE_FILTER and ema21_now is not None:
+        zone_high_val = zone["high"]
+        ema21_above_zone_pct = ((ema21_now - zone_high_val) / zone_high_val * 100.0
+                                if zone_high_val > 0 else 0)
+        ema21_in_resistance_band = (0 < ema21_above_zone_pct <= EMA21_RESISTANCE_MAX_PCT)
+        price_below_ema21 = last_close < ema21_now
+
+        if ema21_in_resistance_band and price_below_ema21:
+            print(f"[PATH-C] {symbol} — SKIP arm: EMA21 {round(ema21_now, precision)} sits "
+                  f"{round(ema21_above_zone_pct, 2)}% above zone_high "
+                  f"{round(zone_high_val, precision)} (≤{EMA21_RESISTANCE_MAX_PCT}%) "
+                  f"and price {last_close} not yet reclaimed EMA21 → waiting for reclaim")
+            save_state(all_state)
+            return
+
     tf_count   = len(zone["tfs"])
     tfs_str    = ",".join(sorted(zone["tfs"]))
     zone_low   = zone["low"]
@@ -1002,6 +1032,7 @@ send_telegram(
     f"🔁 Scan       : <code>Every 30 minutes</code>\n"
     f"🆎 Path C    : <code>(price above EMA ≤{PATH_C_ABOVE_EMA_MAX_PCT}% OR below EMA ≥{PATH_C_BELOW_EMA_MIN_PCT}%) + nearest multi-TF pivot zone below price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m reclaim (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"⚠️ Above-EMA  : <code>support zone must sit ABOVE the EMA when price is within {PATH_C_ABOVE_EMA_MAX_PCT}% above</code>\n"
+    f"🚧 EMA21 gate : <code>skip arm if 4h EMA21 sits ≤{EMA21_RESISTANCE_MAX_PCT}% above zone_high and price hasn't reclaimed EMA21</code>\n"
     f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D + 3D synth, {PATH_C_CANDLES} candles each</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed above entry</code>\n"
     f"🛑 SL         : <code>zone_low × (1 - {PATH_C_SL_BELOW_ZONE_PCT}%)</code>\n"
