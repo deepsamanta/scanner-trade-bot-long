@@ -495,7 +495,7 @@ def compute_qty(entry_price, symbol):
 # PLACE LONG ORDER
 # =====================================================
 
-def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_path):
+def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, signal_info=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
@@ -552,6 +552,31 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
         )
         return False
 
+    sig_block = ""
+    if signal_info:
+        sig_block = (
+            f"\n━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📊 Signal that fired:</b>\n"
+            f"📍 c15        : <code>{signal_info.get('c15')}</code>\n"
+            f"⏪ prev_c15   : <code>{signal_info.get('prev_c15')}</code>\n"
+            f"📈 upperLvl   : <code>{signal_info.get('upper_lvl')}</code>\n"
+            f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
+            f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
+            f"<b>✅ Filters passed:</b>\n"
+            f"• fresh cross : <code>True</code> "
+            f"(prev≤{signal_info.get('upper_lvl')} &amp; c15&gt;{signal_info.get('upper_lvl')})\n"
+            f"• body break  : <code>True</code> "
+            f"(min(o,c)={signal_info.get('min_oc')} &gt; upperLvl)\n"
+            f"• strong bar  : <code>True</code> "
+            f"(body={signal_info.get('body_pct')}% ≥ {signal_info.get('min_body_pct')}%)\n"
+            f"• volume      : <code>True</code> "
+            f"(vol={signal_info.get('vol')} &gt; SMA20×{signal_info.get('vol_mult')}={signal_info.get('vol_threshold')})\n"
+            f"• ATR distance: <code>True</code> "
+            f"(c15 &gt; upperLvl + {signal_info.get('atr_mult')}×ATR = {signal_info.get('atr_threshold')})\n"
+            f"• cooldown    : <code>True</code> "
+            f"({signal_info.get('bars_since_last')} bars since last entry, need ≥{signal_info.get('cooldown_bars')})"
+        )
+
     send_telegram(
         f"🟢 <b>NEW LONG ({entry_path.upper()}) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -560,6 +585,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
         f"🛑 SL      : <code>{sl}</code>  (-{sl_pct_display}%)\n"
         f"📦 Qty     : <code>{qty}</code>\n"
         f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+        f"{sig_block}"
     )
     return True
 
@@ -783,7 +809,30 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[ABORT] {symbol} — order appeared just before placement")
         return
 
-    placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "tl_break")
+    # Snapshot of conditions that satisfied the signal (for telegram)
+    bars_since_last = (
+        (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+        if last_entry_ts > 0 else "n/a"
+    )
+    signal_info = {
+        "c15":             round(c15, precision),
+        "prev_c15":        round(prev_c15, precision),
+        "upper_lvl":       round(upper_lvl, precision),
+        "last_pl":         round(last_pl, precision),
+        "last_ph":         round(last_ph, precision),
+        "min_oc":          round(min(o15, c15), precision),
+        "body_pct":        round(body_pct, 1),
+        "min_body_pct":    MIN_BODY_PCT,
+        "vol":             round(v15, 2),
+        "vol_mult":        VOL_MULT,
+        "vol_threshold":   round(vol_sma * VOL_MULT, 2),
+        "atr_mult":        ATR_MULT,
+        "atr_threshold":   round(upper_lvl + atr_15 * ATR_MULT, precision),
+        "bars_since_last": bars_since_last,
+        "cooldown_bars":   COOLDOWN_BARS,
+    }
+
+    placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "tl_break", signal_info)
     if placed:
         st["in_position"]   = True
         st["entry_path"]    = "tl_break"
