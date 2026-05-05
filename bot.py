@@ -7,7 +7,7 @@ import json
 import os
 import gspread
 
-from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
+from decimal import Decimal, getcontext
 from google.oauth2.service_account import Credentials
 
 from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -25,40 +25,37 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 
 # ─── TRENDLINE CALC (1h) ─────────────────────────────────────────────────────
-SWING_LOOKBACK   = 14
-SLOPE_MULT       = 1.0
-ATR_PERIOD_TL    = 14
+SWING_LOOKBACK   = 14          # pivot lookback (each side)
+SLOPE_MULT       = 1.0         # slope multiplier
+ATR_PERIOD_TL    = 14          # ATR period for trendline slope (1h)
 
 # ─── RISK ────────────────────────────────────────────────────────────────────
-RR_RATIO         = 2.0
-SL_BUFFER_PCT    = 0.1
+RR_RATIO         = 2.0         # reward:risk
+SL_BUFFER_PCT    = 0.1         # extra % below lastPL for SL
 
-# ─── ANTI-FAKEOUT FILTERS (15m) ─────────────────────────────────────────────
+# ─── ANTI-FAKEOUT FILTERS (applied on 15m entry candle) ─────────────────────
 USE_BODY_BREAK   = True
 USE_STRONG_BAR   = True
-MIN_BODY_PCT     = 50.0
+MIN_BODY_PCT     = 50.0        # body ≥ X% of range
 USE_VOLUME       = True
-VOL_MULT         = 1.2
+VOL_MULT         = 1.2         # vol > SMA(20) × mult
 VOL_SMA_PERIOD   = 20
 USE_ATR_DIST     = True
-ATR_MULT         = 0.25
+ATR_MULT         = 0.25        # break ≥ X × ATR(14) beyond TL
 ATR_PERIOD_15M   = 14
 USE_COOLDOWN     = True
-COOLDOWN_BARS    = 5
-
-# ─── ORDER PLACEMENT ────────────────────────────────────────────────────────
-LIMIT_BUFFER_PCT = 0.15      # entry = signal_close × (1 + buffer/100)
+COOLDOWN_BARS    = 5           # 15m bars between entries
 
 # ─── CANDLE COUNTS ───────────────────────────────────────────────────────────
-TL_CANDLES_1H    = 500
-ENTRY_CANDLES    = 60
+TL_CANDLES_1H    = 500         # 1h candles fetched for trendline calc
+ENTRY_CANDLES    = 60          # 15m candles for entry confirmation
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
-RESOLUTION_PRIMARY    = "60"
-RESOLUTION_ENTRY      = "15"
-CANDLE_SECONDS        = 60 * 60
-ENTRY_CANDLE_SECONDS  = 15 * 60
-SCAN_INTERVAL         = 15 * 60
+RESOLUTION_PRIMARY    = "60"            # 1h
+RESOLUTION_ENTRY      = "15"            # 15m
+CANDLE_SECONDS        = 60 * 60         # 1h in seconds
+ENTRY_CANDLE_SECONDS  = 15 * 60         # 15m in seconds
+SCAN_INTERVAL         = 15 * 60         # 15 min
 
 # ─── REQUEST TIMEOUTS ────────────────────────────────────────────────────────
 REQUEST_TIMEOUT      = 15
@@ -120,45 +117,22 @@ def update_sheet_tp(row, value):
     try:
         sheet = get_sheet()
         if sheet is None:
-            print(f"[SHEET] Row {row + 1} TP write skipped — no sheet handle")
-            return False
+            return
         sheet.update_acell(f"B{row + 1}", str(value))
         print(f"[SHEET] Row {row + 1} col B -> {value}")
-        return True
     except Exception as e:
-        print(f"[SHEET] Update TP error (row {row + 1}): {e}")
-        return False
+        print("Sheet update error:", e)
 
 
 def update_sheet_sl(row, value):
     try:
         sheet = get_sheet()
         if sheet is None:
-            print(f"[SHEET] Row {row + 1} SL write skipped — no sheet handle")
-            return False
+            return
         sheet.update_acell(f"C{row + 1}", str(value))
-        print(f"[SHEET] Row {row + 1} col C -> {value}")
-        return True
+        print(f"[SHEET] Row {row + 1} col C (SL) -> {value}")
     except Exception as e:
-        print(f"[SHEET] Update SL error (row {row + 1}): {e}")
-        return False
-
-
-def _cell_blank(df, row, col):
-    if df.shape[1] <= col:
-        return True
-    val = str(df.iloc[row, col]).strip()
-    if val == "":
-        return True
-    if val.upper() == "TP COMPLETED":
-        return False  # already finalized — do NOT overwrite
-    return False
-
-
-def _cell_is_tp_completed(df, row, col=1):
-    if df.shape[1] <= col:
-        return False
-    return str(df.iloc[row, col]).strip().upper() == "TP COMPLETED"
+        print("Sheet SL update error:", e)
 
 
 # =====================================================
@@ -191,7 +165,7 @@ def init_symbol_state():
         "entry_price":   None,
         "tp_level":      None,
         "sl_price":      None,
-        "last_entry_ts": 0,
+        "last_entry_ts": 0,        # ms timestamp of last entry (cooldown anchor)
     }
 
 
@@ -243,86 +217,18 @@ def send_telegram(message):
         }
         requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
     except Exception as e:
-        print(f"[TELEGRAM] Failed: {e}")
+        print(f"[TELEGRAM] Failed to send message: {e}")
 
 
 # =====================================================
-# INSTRUMENT METADATA (cached)
+# PRECISION
 # =====================================================
 
-_instrument_cache = {}
-_INSTRUMENT_CACHE_TTL = 6 * 3600
-
-
-def _decimals_from_step(step: Decimal) -> int:
-    s = format(step.normalize(), "f")
+def get_precision(raw_candle_close):
+    s = str(raw_candle_close)
     if "." in s:
-        return len(s.split(".")[1].rstrip("0"))
+        return len(s.split(".")[1])
     return 0
-
-
-def get_instrument_meta(symbol):
-    now = time.time()
-    cached = _instrument_cache.get(symbol)
-    if cached and (now - cached["ts"]) < _INSTRUMENT_CACHE_TTL:
-        return cached
-
-    pair = fut_pair(symbol)
-    url  = (
-        "https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument"
-        f"?pair={pair}&margin_currency_short_name=USDT"
-    )
-    try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        data     = response.json()
-        inst     = data["instrument"]
-
-        qty_step = Decimal(str(inst.get("quantity_increment", "1")))
-        min_qty  = Decimal(str(inst.get("min_quantity", qty_step)))
-        price_step_raw = (
-            inst.get("price_increment")
-            or inst.get("tick_size")
-            or inst.get("min_price_increment")
-        )
-        price_step = Decimal(str(price_step_raw)) if price_step_raw is not None else None
-
-        meta = {
-            "price_step": price_step,
-            "qty_step":   qty_step,
-            "min_qty":    min_qty,
-            "ts":         now,
-        }
-        _instrument_cache[symbol] = meta
-        return meta
-    except Exception as e:
-        print(f"[INSTRUMENT] {symbol} fetch error: {e}")
-        return {
-            "price_step": None,
-            "qty_step":   Decimal("1"),
-            "min_qty":    Decimal("1"),
-            "ts":         now - _INSTRUMENT_CACHE_TTL + 60,
-        }
-
-
-def round_price(price, step: Decimal, mode: str = "down") -> Decimal:
-    p = Decimal(str(price))
-    if step is None or step == 0:
-        return p
-    units = p / step
-    if mode == "down":
-        units = units.to_integral_value(rounding=ROUND_DOWN)
-    elif mode == "up":
-        units = units.to_integral_value(rounding=ROUND_UP)
-    else:
-        units = units.quantize(Decimal("1"))
-    return (units * step).quantize(step)
-
-
-def fmt_price(price_decimal: Decimal, step: Decimal) -> str:
-    if step is None:
-        return str(price_decimal)
-    decimals = _decimals_from_step(step)
-    return format(price_decimal, f".{decimals}f")
 
 
 # =====================================================
@@ -330,6 +236,7 @@ def fmt_price(price_decimal: Decimal, step: Decimal) -> str:
 # =====================================================
 
 def compute_atr(highs, lows, closes, period):
+    """Wilder's ATR (matches Pine's ta.atr / RMA smoothing)."""
     n = len(closes)
     if n == 0:
         return []
@@ -350,6 +257,18 @@ def compute_atr(highs, lows, closes, period):
 
 
 def compute_trendlines(highs, lows, closes, length, mult):
+    """
+    LuxAlgo-style Trendlines with Breaks (long-side fields).
+    Walks every bar, replicating Pine semantics:
+      slope_ph := ph ? slope : slope_ph
+      upper    := ph ? ph    : upper - slope_ph
+      (and the symmetric pair for the lower line)
+
+    Returns final-bar values:
+        upper_lvl = upper - slope_ph * length     # the projected break level
+        last_ph   = most recent confirmed pivot high (resistance)
+        last_pl   = most recent confirmed pivot low  (support — used for SL)
+    """
     n = len(closes)
     atr_arr = compute_atr(highs, lows, closes, ATR_PERIOD_TL)
 
@@ -366,6 +285,7 @@ def compute_trendlines(highs, lows, closes, length, mult):
         ph = None
         pl = None
 
+        # Pivot at index (i-length) is confirmed at bar i
         if i >= 2 * length:
             c   = i - length
             h_c = highs[c]
@@ -386,6 +306,7 @@ def compute_trendlines(highs, lows, closes, length, mult):
 
         slope = (atr_arr[i] / length * mult) if (atr_arr[i] is not None) else 0.0
 
+        # Upper trendline (descending resistance from pivot highs)
         if ph is not None:
             cur_slope_ph = slope
             cur_upper    = ph
@@ -394,6 +315,7 @@ def compute_trendlines(highs, lows, closes, length, mult):
         elif have_upper:
             cur_upper -= cur_slope_ph
 
+        # Lower trendline (ascending support from pivot lows)
         if pl is not None:
             cur_slope_pl = slope
             cur_lower    = pl
@@ -444,6 +366,10 @@ def fetch_candles(symbol, num_candles_needed, resolution_str=None, candle_second
         print(f"[CANDLES {resolution_str}] {symbol} fetch error: {e}")
         return []
 
+
+# =====================================================
+# RECENT HIGH (TP wick detection)
+# =====================================================
 
 def get_recent_high(symbol):
     try:
@@ -501,8 +427,7 @@ def get_position_by_pair(symbol):
     return None
 
 
-def get_open_buy_order_for_pair(symbol):
-    """Return the full open BUY-side order dict for this pair, or None."""
+def has_open_order(symbol):
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
@@ -516,36 +441,32 @@ def get_open_buy_order_for_pair(symbol):
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         orders   = response.json()
+
         if not isinstance(orders, list):
-            print(f"[get_open_buy_order_for_pair] {symbol} unexpected response: {orders}")
-            return None
+            print(f"[has_open_order] {symbol} unexpected response (request rejected?): {orders}")
+            return False
+
         pair = fut_pair(symbol)
         for o in orders:
             if o.get("pair") == pair:
-                return o
-        return None
+                return True
+        return False
+
     except Exception as e:
-        print(f"get_open_buy_order_for_pair error ({symbol}): {e}")
-        return None
-
-
-def has_open_order(symbol):
-    return get_open_buy_order_for_pair(symbol) is not None
+        print(f"has_open_order error ({symbol}):", e)
+        return False
 
 
 def extract_tp_sl(obj):
     """
-    Pull (tp, sl) out of a position or order dict, trying multiple field names
-    that CoinDCX has used across versions. Returns (tp_float, sl_float) where
-    either or both can be None if not found / zero.
+    Pull (tp, sl) out of a CoinDCX position/order dict.
+    Tries multiple field names CoinDCX has used. Returns (tp, sl) as floats;
+    either may be None if the field is missing or zero.
     """
     if not isinstance(obj, dict):
         return None, None
-
-    tp_keys = ["take_profit_price", "take_profit_trigger", "tp_price",
-               "take_profit", "take_profit_value"]
-    sl_keys = ["stop_loss_price", "stop_loss_trigger", "sl_price",
-               "stop_loss", "stop_loss_value"]
+    tp_keys = ["take_profit_price", "take_profit_trigger", "tp_price"]
+    sl_keys = ["stop_loss_price", "stop_loss_trigger", "sl_price"]
 
     def _pick(keys):
         for k in keys:
@@ -564,133 +485,56 @@ def extract_tp_sl(obj):
 
 
 # =====================================================
-# SHEET LEVEL SYNC  (the critical fix)
-# =====================================================
-
-def sync_sheet_levels(row, df, st, position=None, order=None):
-    """
-    Ensure the sheet's TP (col B) and SL (col C) cells reflect the actual
-    levels currently active on the exchange.
-
-    Resolution order for each level:
-        1. Local state (st['tp_level'] / st['sl_price'])
-        2. Exchange position object  → take_profit_price / stop_loss_price
-        3. Pending limit order object → same fields
-
-    Will NOT overwrite a "TP COMPLETED" marker in col B.
-    """
-    # Don't touch col B if it already says TP COMPLETED
-    tp_locked = _cell_is_tp_completed(df, row, 1)
-
-    tp_state = st.get("tp_level")
-    sl_state = st.get("sl_price")
-
-    # Try exchange fallbacks if state is missing
-    if tp_state is None or sl_state is None:
-        tp_pos, sl_pos = extract_tp_sl(position) if position else (None, None)
-        tp_ord, sl_ord = extract_tp_sl(order)    if order    else (None, None)
-        if tp_state is None:
-            tp_state = tp_pos if tp_pos is not None else tp_ord
-            if tp_state is not None:
-                st["tp_level"] = tp_state
-        if sl_state is None:
-            sl_state = sl_pos if sl_pos is not None else sl_ord
-            if sl_state is not None:
-                st["sl_price"] = sl_state
-
-    # Push to sheet if cell is blank and we have a value
-    if not tp_locked and tp_state is not None and _cell_blank(df, row, 1):
-        print(f"[SHEET-SYNC] Row {row + 1} — TP cell blank, pushing {tp_state}")
-        update_sheet_tp(row, tp_state)
-    if sl_state is not None and _cell_blank(df, row, 2):
-        print(f"[SHEET-SYNC] Row {row + 1} — SL cell blank, pushing {sl_state}")
-        update_sheet_sl(row, sl_state)
-
-
-# =====================================================
 # QUANTITY
 # =====================================================
 
-def compute_qty(entry_price, symbol):
-    meta     = get_instrument_meta(symbol)
-    qty_step = meta["qty_step"]
-    min_qty  = meta["min_qty"]
-    step     = max(qty_step, min_qty)
+def get_quantity_step(symbol):
+    try:
+        pair = fut_pair(symbol)
+        url  = (
+            "https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument"
+            f"?pair={pair}&margin_currency_short_name=USDT"
+        )
+        response   = requests.get(url, timeout=REQUEST_TIMEOUT)
+        data       = response.json()
+        instrument = data["instrument"]
+        quantity_increment = Decimal(str(instrument["quantity_increment"]))
+        min_quantity       = Decimal(str(instrument["min_quantity"]))
+        return max(quantity_increment, min_quantity)
+    except Exception:
+        return Decimal("1")
 
+
+def compute_qty(entry_price, symbol):
+    step     = get_quantity_step(symbol)
     capital  = Decimal(str(CAPITAL_USDT))
     leverage = Decimal(str(LEVERAGE))
     exposure = capital * leverage
     raw_qty  = exposure / Decimal(str(entry_price))
-    units    = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
-    qty      = units * step
-    if qty < min_qty:
-        qty = min_qty
-    return qty.quantize(step)
+    qty = (raw_qty / step).quantize(Decimal("1")) * step
+    if qty <= 0:
+        qty = step
+    qty = qty.quantize(step)
+    return float(qty)
 
 
 # =====================================================
 # PLACE LONG ORDER
 # =====================================================
 
-def place_long_order(symbol, signal_close, tp_raw, sl_raw, entry_path, signal_info=None):
-    meta       = get_instrument_meta(symbol)
-    price_step = meta["price_step"]
+def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, signal_info=None):
+    entry = round(entry_price, precision)
+    tp    = round(tp_price,    precision)
+    sl    = round(sl_price,    precision)
 
-    entry_target = (
-        Decimal(str(signal_close))
-        * (Decimal("1") + Decimal(str(LIMIT_BUFFER_PCT)) / Decimal("100"))
-    )
+    qty = compute_qty(entry_price, symbol)
 
-    if price_step is not None:
-        entry_dec = round_price(entry_target, price_step, "up")
-        sl_dec    = round_price(sl_raw,        price_step, "down")
-        tp_dec    = round_price(tp_raw,        price_step, "up")
-    else:
-        s = str(signal_close)
-        decimals = len(s.split(".")[1]) if "." in s else 0
-        q = Decimal(10) ** -decimals if decimals > 0 else Decimal("1")
-        entry_dec  = entry_target.quantize(q, rounding=ROUND_UP)
-        sl_dec     = Decimal(str(sl_raw)).quantize(q, rounding=ROUND_DOWN)
-        tp_dec     = Decimal(str(tp_raw)).quantize(q, rounding=ROUND_UP)
-        price_step = q
-
-    # Validate ordering with at least 1-tick gap
-    if not (sl_dec + price_step <= entry_dec and entry_dec + price_step <= tp_dec):
-        msg = (f"invalid levels SL={sl_dec} entry={entry_dec} TP={tp_dec} "
-               f"(need SL < entry < TP, ≥1 tick apart)")
-        print(f"[VALIDATION] {symbol} {msg}")
-        send_telegram(
-            f"⚠️ <b>ORDER SKIPPED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📍 Entry : <code>{entry_dec}</code>\n"
-            f"🎯 TP    : <code>{tp_dec}</code>\n"
-            f"🛑 SL    : <code>{sl_dec}</code>\n"
-            f"⚠️ Reason: {msg}"
-        )
-        return False, None, None, None
-
-    qty_dec = compute_qty(float(entry_dec), symbol)
-    if qty_dec <= 0:
-        send_telegram(
-            f"⚠️ <b>ORDER SKIPPED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ Reason: computed qty ≤ 0"
-        )
-        return False, None, None, None
-
-    entry_str = fmt_price(entry_dec, price_step)
-    tp_str    = fmt_price(tp_dec,    price_step)
-    sl_str    = fmt_price(sl_dec,    price_step)
-    qty_str   = format(qty_dec, "f")
-
-    tp_pct = float((tp_dec   - entry_dec) / entry_dec * 100)
-    sl_pct = float((entry_dec - sl_dec)   / entry_dec * 100)
+    tp_pct_display = round(((tp - entry) / entry) * 100, 2) if entry else 0
+    sl_pct_display = round(((entry - sl) / entry) * 100, 2) if entry else 0
 
     print(
-        f"[LONG TRADE] {symbol} BUY ({entry_path}) | "
-        f"signal_close={signal_close} +{LIMIT_BUFFER_PCT}% buffer → "
-        f"Entry {entry_str} | TP {tp_str} (+{tp_pct:.2f}%) | "
-        f"SL {sl_str} (-{sl_pct:.2f}%) | Qty {qty_str}"
+        f"[LONG TRADE] {symbol} BUY ({entry_path}) | Entry {entry} | "
+        f"TP {tp} (+{tp_pct_display}%) | SL {sl} (-{sl_pct_display}%) | Qty {qty}"
     )
 
     body = {
@@ -699,11 +543,11 @@ def place_long_order(symbol, signal_close, tp_raw, sl_raw, entry_path, signal_in
             "side":              "buy",
             "pair":              fut_pair(symbol),
             "order_type":        "limit_order",
-            "price":             entry_str,
-            "total_quantity":    qty_str,
+            "price":             entry,
+            "total_quantity":    qty,
             "leverage":          LEVERAGE,
-            "take_profit_price": tp_str,
-            "stop_loss_price":   sl_str,
+            "take_profit_price": tp,
+            "stop_loss_price":   sl,
         },
     }
 
@@ -711,45 +555,29 @@ def place_long_order(symbol, signal_close, tp_raw, sl_raw, entry_path, signal_in
     try:
         response = requests.post(
             BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
-            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+            data=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
         result = response.json()
     except Exception as e:
         print(f"[ERROR] {symbol} order request failed: {e}")
-        send_telegram(
-            f"❌ <b>LONG ORDER NETWORK ERROR — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ Error : <code>{str(e)[:200]}</code>"
-        )
-        return False, None, None, None
+        return False
 
     print(f"[API] {symbol} response: {result}")
 
-    success = False
-    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
-        success = "id" in result[0] or "client_order_id" in result[0]
-    elif isinstance(result, dict):
-        if "orders" in result and isinstance(result["orders"], list) and len(result["orders"]) > 0:
-            success = True
-        elif "order" in result and isinstance(result["order"], dict):
-            success = True
-
-    if not success:
-        err_msg = (result.get("message") if isinstance(result, dict) else None) \
-                  or (result.get("error") if isinstance(result, dict) else None) \
-                  or str(result)[:300]
-        print(f"[ERROR] {symbol} long order not placed: {err_msg}")
+    if "order" not in result and not isinstance(result, list):
+        print(f"[ERROR] {symbol} long order not placed: {result}")
         send_telegram(
             f"❌ <b>LONG ORDER REJECTED — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🛤 Path    : <code>{entry_path}</code>\n"
-            f"📍 Entry   : <code>{entry_str}</code>\n"
-            f"🎯 TP      : <code>{tp_str}</code>\n"
-            f"🛑 SL      : <code>{sl_str}</code>\n"
-            f"📦 Qty     : <code>{qty_str}</code>\n"
-            f"⚠️ Reason  : <code>{str(err_msg)[:300]}</code>"
+            f"📍 Entry   : <code>{entry}</code>\n"
+            f"🎯 TP      : <code>{tp}</code>\n"
+            f"🛑 SL      : <code>{sl}</code>\n"
+            f"⚠️ Response : <code>{str(result)[:200]}</code>"
         )
-        return False, None, None, None
+        return False
 
     sig_block = ""
     if signal_info:
@@ -762,33 +590,39 @@ def place_long_order(symbol, signal_close, tp_raw, sl_raw, entry_path, signal_in
             f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
             f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
             f"<b>✅ Filters passed:</b>\n"
-            f"• fresh cross : <code>True</code>\n"
-            f"• body break  : <code>True</code> (min(o,c)={signal_info.get('min_oc')})\n"
-            f"• strong bar  : <code>True</code> (body={signal_info.get('body_pct')}%)\n"
-            f"• volume      : <code>True</code> (vol={signal_info.get('vol')} &gt; {signal_info.get('vol_threshold')})\n"
-            f"• ATR distance: <code>True</code> (thresh={signal_info.get('atr_threshold')})\n"
-            f"• cooldown    : <code>True</code> ({signal_info.get('bars_since_last')} bars)"
+            f"• fresh cross : <code>True</code> "
+            f"(prev≤{signal_info.get('upper_lvl')} &amp; c15&gt;{signal_info.get('upper_lvl')})\n"
+            f"• body break  : <code>True</code> "
+            f"(min(o,c)={signal_info.get('min_oc')} &gt; upperLvl)\n"
+            f"• strong bar  : <code>True</code> "
+            f"(body={signal_info.get('body_pct')}% ≥ {signal_info.get('min_body_pct')}%)\n"
+            f"• volume      : <code>True</code> "
+            f"(vol={signal_info.get('vol')} &gt; SMA20×{signal_info.get('vol_mult')}={signal_info.get('vol_threshold')})\n"
+            f"• ATR distance: <code>True</code> "
+            f"(c15 &gt; upperLvl + {signal_info.get('atr_mult')}×ATR = {signal_info.get('atr_threshold')})\n"
+            f"• cooldown    : <code>True</code> "
+            f"({signal_info.get('bars_since_last')} bars since last entry, need ≥{signal_info.get('cooldown_bars')})"
         )
 
     send_telegram(
         f"🟢 <b>NEW LONG ({entry_path.upper()}) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry   : <code>{entry_str}</code> "
-        f"(<i>signal {signal_close}, +{LIMIT_BUFFER_PCT}% buffer</i>)\n"
-        f"🎯 TP      : <code>{tp_str}</code>  (+{tp_pct:.2f}%)\n"
-        f"🛑 SL      : <code>{sl_str}</code>  (-{sl_pct:.2f}%)\n"
-        f"📦 Qty     : <code>{qty_str}</code>\n"
+        f"📍 Entry   : <code>{entry}</code>\n"
+        f"🎯 TP      : <code>{tp}</code>  (+{tp_pct_display}%)\n"
+        f"🛑 SL      : <code>{sl}</code>  (-{sl_pct_display}%)\n"
+        f"📦 Qty     : <code>{qty}</code>\n"
         f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
         f"{sig_block}"
     )
-    return True, entry_dec, tp_dec, sl_dec
+    return True
 
 
 # =====================================================
-# MAIN PER-SYMBOL LOGIC
+# MAIN PER-SYMBOL LOGIC  (Trendline Break — long only)
 # =====================================================
 
 def check_and_trade(symbol, row, df, all_state):
+    # ─── Fetch 1h for trendline / S-R ────────────────────────
     candles_1h = fetch_candles(symbol, TL_CANDLES_1H, RESOLUTION_PRIMARY, CANDLE_SECONDS)
     min_1h_needed = SWING_LOOKBACK * 2 + ATR_PERIOD_TL + 5
 
@@ -796,11 +630,12 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[SKIP] {symbol} — insufficient 1h candles ({len(candles_1h)})")
         return
 
+    # Drop in-progress 1h bar
     now_ms = int(time.time() * 1000)
     if len(candles_1h) >= 1 and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS * 1000:
         candles_1h = candles_1h[:-1]
     if len(candles_1h) < min_1h_needed:
-        print(f"[SKIP] {symbol} — insufficient closed 1h candles")
+        print(f"[SKIP] {symbol} — insufficient closed 1h candles ({len(candles_1h)})")
         return
 
     highs_1h  = [float(c["high"])  for c in candles_1h]
@@ -812,11 +647,14 @@ def check_and_trade(symbol, row, df, all_state):
     last_pl   = tl["last_pl"]
     last_ph   = tl["last_ph"]
 
+    if upper_lvl is None or last_pl is None or last_ph is None:
+        print(f"[SKIP] {symbol} — trendline / pivots not ready yet")
+        return
+
+    precision     = get_precision(candles_1h[-1]["close"])
     last_close_1h = closes_1h[-1]
 
-    s = str(candles_1h[-1]["close"])
-    precision = len(s.split(".")[1]) if "." in s else 0
-
+    # Per-symbol state
     st = all_state.get(symbol)
     if st is None:
         st = init_symbol_state()
@@ -828,7 +666,7 @@ def check_and_trade(symbol, row, df, all_state):
     tp_raw = df.iloc[row, 1] if df.shape[1] > 1 else ""
 
     if str(tp_raw).strip().upper() == "TP COMPLETED":
-        print(f"[SKIP] {symbol} — TP COMPLETED marker in sheet")
+        print(f"[SKIP] {symbol} — TP COMPLETED marker in sheet, not re-entering")
         save_state(all_state)
         return
 
@@ -843,22 +681,26 @@ def check_and_trade(symbol, row, df, all_state):
         hit_price = None
 
         if last_close_1h >= tp_stored:
-            tp_hit, hit_kind, hit_price = True, "close", last_close_1h
+            tp_hit    = True
+            hit_kind  = "close"
+            hit_price = last_close_1h
 
         if not tp_hit:
             recent_high = get_recent_high(symbol)
             if recent_high is not None and recent_high >= tp_stored:
-                tp_hit, hit_kind, hit_price = True, "wick", recent_high
+                tp_hit    = True
+                hit_kind  = "wick"
+                hit_price = recent_high
 
         if tp_hit:
             update_sheet_tp(row, "TP COMPLETED")
-            print(f"[TP HIT] {symbol} — {hit_kind} {hit_price} ≥ TP {tp_stored}")
+            print(f"[TP HIT] {symbol} — {hit_kind} {hit_price} ≥ stored TP {tp_stored}")
             send_telegram(
                 f"🎯 <b>TP HIT ({hit_kind}) — {symbol}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📍 {hit_kind.capitalize():8}: <code>{hit_price}</code>\n"
                 f"🎯 TP       : <code>{tp_stored}</code>\n"
-                f"✅ Marked <b>TP COMPLETED</b>"
+                f"✅ Marked <b>TP COMPLETED</b> in sheet — no further entries on this coin"
             )
             if st.get("in_position"):
                 prev_last_entry = st.get("last_entry_ts", 0)
@@ -868,27 +710,34 @@ def check_and_trade(symbol, row, df, all_state):
             return
 
     # =========================================================================
-    # RECONCILE WITH EXCHANGE — populate state & sheet from live position/order
+    # RECONCILE WITH EXCHANGE
     # =========================================================================
     position = get_position_by_pair(symbol)
 
     if position is not None:
-        # Pull TP/SL from exchange position to fill state if missing
-        tp_pos, sl_pos = extract_tp_sl(position)
         if not st.get("in_position"):
             entry_px = float(position.get("avg_price") or position.get("entry_price") or last_close_1h)
             st["in_position"] = True
             st["entry_path"]  = st.get("entry_path") or "tl_break"
             st["entry_price"] = entry_px
-            print(f"[RECONCILE] {symbol} — reconstructed state from exchange position "
-                  f"(entry={entry_px}, tp={tp_pos}, sl={sl_pos})")
-        # Always refresh state TP/SL from exchange (source of truth) when present
-        if tp_pos is not None:
-            st["tp_level"] = tp_pos
-        if sl_pos is not None:
-            st["sl_price"] = sl_pos
+            print(f"[RECONCILE] {symbol} — reconstructed state from exchange position")
 
-        sync_sheet_levels(row, df, st, position=position)
+        # ── Sheet recovery: if state has no TP/SL, pull from exchange position.
+        #    Then write to sheet B/C if those cells are blank. Never overwrites
+        #    "TP COMPLETED" because that case already returned earlier.
+        tp_pos, sl_pos = extract_tp_sl(position)
+        if st.get("tp_level") is None and tp_pos is not None:
+            st["tp_level"] = round(tp_pos, precision)
+        if st.get("sl_price") is None and sl_pos is not None:
+            st["sl_price"] = round(sl_pos, precision)
+
+        b_val = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
+        c_val = str(df.iloc[row, 2]).strip() if df.shape[1] > 2 else ""
+        if st.get("tp_level") is not None and b_val == "":
+            update_sheet_tp(row, st["tp_level"])
+        if st.get("sl_price") is not None and c_val == "":
+            update_sheet_sl(row, st["sl_price"])
+
         save_state(all_state)
         return
 
@@ -908,23 +757,8 @@ def check_and_trade(symbol, row, df, all_state):
         st = all_state[symbol]
         save_state(all_state)
 
-    # ── Open limit order on book (no position yet) ───────────────────────
-    open_order = get_open_buy_order_for_pair(symbol)
-    if open_order is not None:
-        tp_ord, sl_ord = extract_tp_sl(open_order)
-        if tp_ord is not None and st.get("tp_level") is None:
-            st["tp_level"] = tp_ord
-        if sl_ord is not None and st.get("sl_price") is None:
-            st["sl_price"] = sl_ord
-        print(f"[OPEN ORDER] {symbol} — pending limit BUY (tp={tp_ord}, sl={sl_ord}), skipping new entry")
-        sync_sheet_levels(row, df, st, order=open_order)
-        save_state(all_state)
-        return
-
-    # No position, no pending order — proceed with strategy evaluation
-    if upper_lvl is None or last_pl is None or last_ph is None:
-        print(f"[SKIP] {symbol} — trendline / pivots not ready yet")
-        save_state(all_state)
+    if has_open_order(symbol):
+        print(f"[OPEN ORDER] {symbol} — unfilled entry order on book, skipping")
         return
 
     # =========================================================================
@@ -953,33 +787,36 @@ def check_and_trade(symbol, row, df, all_state):
     ts15 = int(last15["time"])
     prev_c15 = float(prev15["close"])
 
+    # ─── 15m filter calcs ────────────────────────────────────
     bar_range = h15 - l15
     bar_body  = abs(c15 - o15)
     body_pct  = (bar_body / bar_range * 100) if bar_range > 0 else 0
 
-    vols    = [float(c.get("volume", 0)) for c in candles_15m[-VOL_SMA_PERIOD:]]
+    vols = [float(c.get("volume", 0)) for c in candles_15m[-VOL_SMA_PERIOD:]]
     vol_sma = sum(vols) / len(vols) if vols else 0
 
     highs_15m  = [float(c["high"])  for c in candles_15m]
     lows_15m   = [float(c["low"])   for c in candles_15m]
     closes_15m = [float(c["close"]) for c in candles_15m]
     atr_arr_15 = compute_atr(highs_15m, lows_15m, closes_15m, ATR_PERIOD_15M)
-    atr_15     = atr_arr_15[-1] if atr_arr_15[-1] is not None else 0
+    atr_15 = atr_arr_15[-1] if atr_arr_15[-1] is not None else 0
 
-    fresh_cross = (c15 > upper_lvl) and (prev_c15 <= upper_lvl)
+    # ─── Filter conditions ──────────────────────────────────
+    fresh_cross = (c15 > upper_lvl) and (prev_c15 <= upper_lvl)   # mirrors greenB (first cross)
     body_break  = (not USE_BODY_BREAK) or (min(o15, c15) > upper_lvl)
     strong_bar  = (not USE_STRONG_BAR) or (body_pct >= MIN_BODY_PCT)
     vol_ok      = (not USE_VOLUME)     or (v15 > vol_sma * VOL_MULT)
     atr_ok      = (not USE_ATR_DIST)   or (c15 > upper_lvl + atr_15 * ATR_MULT)
 
+    # Cooldown
     last_entry_ts = st.get("last_entry_ts", 0) or 0
     if USE_COOLDOWN and last_entry_ts > 0:
         bars_since  = (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
         cooldown_ok = bars_since >= COOLDOWN_BARS
     else:
         cooldown_ok = True
-        bars_since  = "n/a"
 
+    # ─── Scan log ───────────────────────────────────────────
     print(
         f"[SCAN] {symbol} | c15={c15} prev_c15={prev_c15} | "
         f"upperLvl={round(upper_lvl, precision)} lastPL={round(last_pl, precision)} "
@@ -996,14 +833,19 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    sl_raw = last_pl * (1 - SL_BUFFER_PCT / 100)
-    risk   = c15 - sl_raw
+    # ─── Place entry ────────────────────────────────────────
+    entry_price = c15
+    sl_price    = last_pl * (1 - SL_BUFFER_PCT / 100)
+    risk        = entry_price - sl_price
+
     if risk <= 0:
-        print(f"[SKIP] {symbol} — invalid risk")
+        print(f"[SKIP] {symbol} — invalid risk (entry {entry_price} ≤ SL {sl_price})")
         save_state(all_state)
         return
-    tp_raw = c15 + risk * RR_RATIO
 
+    tp_price = entry_price + risk * RR_RATIO
+
+    # Last-second guards
     if get_position_by_pair(symbol) is not None:
         print(f"[ABORT] {symbol} — position appeared just before placement")
         return
@@ -1011,6 +853,11 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[ABORT] {symbol} — order appeared just before placement")
         return
 
+    # Snapshot of conditions that satisfied the signal (for telegram)
+    bars_since_last = (
+        (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+        if last_entry_ts > 0 else "n/a"
+    )
     signal_info = {
         "c15":             round(c15, precision),
         "prev_c15":        round(prev_c15, precision),
@@ -1025,22 +872,18 @@ def check_and_trade(symbol, row, df, all_state):
         "vol_threshold":   round(vol_sma * VOL_MULT, 2),
         "atr_mult":        ATR_MULT,
         "atr_threshold":   round(upper_lvl + atr_15 * ATR_MULT, precision),
-        "bars_since_last": bars_since,
+        "bars_since_last": bars_since_last,
         "cooldown_bars":   COOLDOWN_BARS,
     }
 
-    placed, entry_dec, tp_dec, sl_dec = place_long_order(
-        symbol, c15, tp_raw, sl_raw, "tl_break", signal_info
-    )
-
+    placed = place_long_order(symbol, entry_price, tp_price, sl_price, precision, "tl_break", signal_info)
     if placed:
         st["in_position"]   = True
         st["entry_path"]    = "tl_break"
-        st["entry_price"]   = float(entry_dec)
-        st["tp_level"]      = float(tp_dec)
-        st["sl_price"]      = float(sl_dec)
+        st["entry_price"]   = round(entry_price, precision)
+        st["tp_level"]      = round(tp_price,    precision)
+        st["sl_price"]      = round(sl_price,    precision)
         st["last_entry_ts"] = ts15
-        save_state(all_state)               # save BEFORE sheet writes — guards against crash
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
 
@@ -1060,8 +903,10 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy   : <code>Trendline Break + Anti-Fakeout (LONG only)</code>\n"
     f"⏱ TL / S-R   : <code>1h closed bars (lookback={SWING_LOOKBACK}, slope×{SLOPE_MULT})</code>\n"
-    f"⚡ Entry      : <code>15m close, limit BUY +{LIMIT_BUFFER_PCT}% buffer</code>\n"
+    f"⚡ Entry      : <code>15m close confirmation</code>\n"
     f"🔁 Scan       : <code>Every 15 minutes</code>\n"
+    f"🧪 Filters    : <code>body-break, body≥{MIN_BODY_PCT:.0f}%, vol&gt;SMA{VOL_SMA_PERIOD}×{VOL_MULT}, "
+    f"break≥{ATR_MULT}×ATR{ATR_PERIOD_15M}, cooldown={COOLDOWN_BARS}×15m</code>\n"
     f"🎯 TP         : <code>entry + {RR_RATIO}×risk</code>\n"
     f"🛑 SL         : <code>lastPL × (1 - {SL_BUFFER_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
@@ -1072,7 +917,7 @@ while True:
         df = get_sheet_data()
 
         if df.empty:
-            print("[WARN] Sheet returned empty — possible auth issue")
+            print("[WARN] Sheet returned empty — possible auth issue, retrying in scan interval")
             time.sleep(SCAN_INTERVAL)
             continue
 
@@ -1084,7 +929,7 @@ while True:
 
         for row in range(len(df)):
             pair = df.iloc[row, 0]
-            if not str(pair).strip():
+            if not pair:
                 continue
             symbol = normalize_symbol(pair)
             try:
