@@ -118,7 +118,7 @@ def update_sheet_tp(row, value):
         sheet = get_sheet()
         if sheet is None:
             return
-        sheet.update(f"B{row + 1}", [[str(value)]])
+        sheet.update_acell(f"B{row + 1}", str(value))
         print(f"[SHEET] Row {row + 1} col B -> {value}")
     except Exception as e:
         print("Sheet update error:", e)
@@ -129,7 +129,7 @@ def update_sheet_sl(row, value):
         sheet = get_sheet()
         if sheet is None:
             return
-        sheet.update(f"C{row + 1}", [[str(value)]])
+        sheet.update_acell(f"C{row + 1}", str(value))
         print(f"[SHEET] Row {row + 1} col C (SL) -> {value}")
     except Exception as e:
         print("Sheet SL update error:", e)
