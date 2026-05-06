@@ -946,6 +946,12 @@ def check_and_trade(symbol, row, df, all_state):
                     st["retest_upper_lvl"] = None
                     st["retest_last_ph"]   = None
 
+                elif bars_armed < 1:
+                    # Just armed on THIS scan — don't allow same-bar trigger.
+                    # Wait for next 15m bar before evaluating bounce conditions.
+                    print(f"[RETEST-WAIT] {symbol} — just armed this bar, "
+                          f"waiting for next 15m bar before checking bounce")
+
                 else:
                     # TRIGGER conditions:
                     #   1. wick of this 15m candle came within ±RETEST_TOUCH_PCT of upperLvl
