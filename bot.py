@@ -39,8 +39,8 @@ SLOPE_MULT       = 1.0         # slope multiplier
 ATR_PERIOD_TL    = 14          # ATR period for trendline slope (1h)
 
 # ─── RISK ────────────────────────────────────────────────────────────────────
-RR_RATIO         = 2.0         # reward:risk
-SL_BUFFER_PCT    = 0.1         # extra % below lastPL for SL
+TP_PCT           = 3.0         # fixed take-profit: entry × (1 + TP_PCT/100)
+SL_BELOW_TL_PCT  = 1.5         # SL placed X% below the upper trendline (broken resistance turned support)
 
 # ─── ANTI-FAKEOUT FILTERS (applied on 15m entry candle, tl_break path) ──────
 USE_BODY_BREAK   = True
@@ -1033,16 +1033,17 @@ def check_and_trade(symbol, row, df, all_state):
         return
 
     # ─── Compute SL/TP (same geometry for both paths) ───────
+    # SL = SL_BELOW_TL_PCT% below the upper trendline (the broken resistance
+    #      that now acts as support). TP = fixed TP_PCT% above entry.
     entry_price = c15
-    sl_price    = last_pl * (1 - SL_BUFFER_PCT / 100)
+    sl_price    = upper_lvl * (1 - SL_BELOW_TL_PCT / 100)
+    tp_price    = entry_price * (1 + TP_PCT / 100)
     risk        = entry_price - sl_price
 
-    if risk <= 0:
+    if risk <= 0 or sl_price >= entry_price:
         print(f"[SKIP] {symbol} — invalid risk (entry {entry_price} ≤ SL {sl_price})")
         save_state(all_state)
         return
-
-    tp_price = entry_price + risk * RR_RATIO
 
     # Last-second guards
     if get_position_by_pair(symbol) is not None:
@@ -1091,8 +1092,8 @@ send_telegram(
     f"🛤 Paths      : <code>tl_break + tl_retest "
     f"(retest: {'ON' if USE_RETEST_PATH else 'OFF'}, "
     f"max {RETEST_MAX_BARS} bars, ±{RETEST_TOUCH_PCT}% touch, body≥{RETEST_MIN_BODY_PCT}%)</code>\n"
-    f"🎯 TP         : <code>entry + {RR_RATIO}×risk</code>\n"
-    f"🛑 SL         : <code>lastPL × (1 - {SL_BUFFER_PCT}%)</code>\n"
+    f"🎯 TP         : <code>entry × (1 + {TP_PCT}%)</code>\n"
+    f"🛑 SL         : <code>upperLvl × (1 - {SL_BELOW_TL_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
