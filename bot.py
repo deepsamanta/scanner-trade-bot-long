@@ -33,6 +33,17 @@ BASE_URL = "https://api.coindcx.com"
 #                  where the broken trendline acts as new support.
 # =============================================================================
 
+# ─── TRENDLINE TOUCH CONFIRMATION ───────────────────────────────────────────
+# Before either path can fire, the trendline must have been TOUCHED at least
+# this many times since its anchor pivot. A "touch" = a 1h bar whose high
+# reached within TOUCH_TOLERANCE_PCT of the line but whose close stayed below
+# (i.e. price tried to break and failed). Consecutive bars in the same
+# approach are collapsed: price must drop ≥ TOUCH_GAP_PCT below the line
+# before the next attempt counts as a separate touch.
+MIN_TL_TOUCHES       = 2       # require ≥ N failed-break attempts on the line
+TOUCH_TOLERANCE_PCT  = 0.5     # high within ±X% of line counts as approaching
+TOUCH_GAP_PCT        = 1.0     # must drop X% below line to "reset" for next touch
+
 # ─── TRENDLINE CALC (1h) ─────────────────────────────────────────────────────
 SWING_LOOKBACK   = 14          # pivot lookback (each side)
 SLOPE_MULT       = 1.0         # slope multiplier
@@ -278,9 +289,14 @@ def compute_atr(highs, lows, closes, period):
     return atr
 
 
-def compute_trendlines(highs, lows, closes, length, mult):
+def compute_trendlines(opens, highs, lows, closes, length, mult):
     """
     LuxAlgo-style Trendlines with Breaks (long-side fields).
+
+    Pivot detection uses the CANDLE BODY (max(open,close) for highs,
+    min(open,close) for lows), so wicks/spikes never anchor a trendline.
+    ATR (used for slope decay) still uses true high/low.
+
     Walks every bar, replicating Pine semantics:
       slope_ph := ph ? slope : slope_ph
       upper    := ph ? ph    : upper - slope_ph
@@ -288,11 +304,15 @@ def compute_trendlines(highs, lows, closes, length, mult):
 
     Returns final-bar values:
         upper_lvl = upper - slope_ph * length     # the projected break level
-        last_ph   = most recent confirmed pivot high (resistance)
-        last_pl   = most recent confirmed pivot low  (support — used for SL)
+        last_ph   = most recent pivot high body-top  (resistance)
+        last_pl   = most recent pivot low  body-bottom (support — context)
     """
     n = len(closes)
     atr_arr = compute_atr(highs, lows, closes, ATR_PERIOD_TL)
+
+    # Body extremes — used for pivot detection (ignores wicks)
+    body_tops    = [max(opens[i], closes[i]) for i in range(n)]
+    body_bottoms = [min(opens[i], closes[i]) for i in range(n)]
 
     cur_upper = 0.0
     cur_lower = 0.0
@@ -303,41 +323,46 @@ def compute_trendlines(highs, lows, closes, length, mult):
     have_upper = False
     have_lower = False
 
+    # Per-bar projected upper level (used for touch counting)
+    upper_lvl_history = [None] * n
+    last_ph_bar_idx   = None     # bar index where most recent pivot high was confirmed
+
     for i in range(n):
         ph = None
         pl = None
 
-        # Pivot at index (i-length) is confirmed at bar i
+        # Pivot at index (i-length) is confirmed at bar i — using BODIES
         if i >= 2 * length:
-            c   = i - length
-            h_c = highs[c]
-            l_c = lows[c]
+            c    = i - length
+            bt_c = body_tops[c]
+            bb_c = body_bottoms[c]
             is_ph = True
             is_pl = True
             for k in range(1, length + 1):
-                if highs[c - k] >= h_c or highs[c + k] >= h_c:
+                if body_tops[c - k]    >= bt_c or body_tops[c + k]    >= bt_c:
                     is_ph = False
-                if lows[c - k]  <= l_c or lows[c + k]  <= l_c:
+                if body_bottoms[c - k] <= bb_c or body_bottoms[c + k] <= bb_c:
                     is_pl = False
                 if not is_ph and not is_pl:
                     break
             if is_ph:
-                ph = h_c
+                ph = bt_c   # anchor trendline at the body TOP
             if is_pl:
-                pl = l_c
+                pl = bb_c   # anchor trendline at the body BOTTOM
 
         slope = (atr_arr[i] / length * mult) if (atr_arr[i] is not None) else 0.0
 
-        # Upper trendline (descending resistance from pivot highs)
+        # Upper trendline (descending resistance from pivot body-tops)
         if ph is not None:
-            cur_slope_ph = slope
-            cur_upper    = ph
-            cur_last_ph  = ph
-            have_upper   = True
+            cur_slope_ph    = slope
+            cur_upper       = ph
+            cur_last_ph     = ph
+            have_upper      = True
+            last_ph_bar_idx = i             # remember when this anchor confirmed
         elif have_upper:
             cur_upper -= cur_slope_ph
 
-        # Lower trendline (ascending support from pivot lows)
+        # Lower trendline (ascending support from pivot body-bottoms)
         if pl is not None:
             cur_slope_pl = slope
             cur_lower    = pl
@@ -346,14 +371,48 @@ def compute_trendlines(highs, lows, closes, length, mult):
         elif have_lower:
             cur_lower += cur_slope_pl
 
+        # Snapshot the projected upper level at THIS bar, for touch counting
+        if have_upper:
+            upper_lvl_history[i] = cur_upper - cur_slope_ph * length
+
     upper_lvl = (cur_upper - cur_slope_ph * length) if have_upper else None
     lower_lvl = (cur_lower + cur_slope_pl * length) if have_lower else None
 
+    # ── Count touches on the CURRENT upper trendline ───────────────────────
+    # Walk bars after the last pivot-high confirmation. A touch attempt is a
+    # bar whose high reached the line (within TOUCH_TOLERANCE_PCT) but whose
+    # close stayed below. Consecutive touch bars are collapsed via a
+    # state machine: we only count a NEW touch after price has dropped at
+    # least TOUCH_GAP_PCT below the line in between.
+    touches_above = 0
+    if last_ph_bar_idx is not None and last_ph_bar_idx + 1 < n:
+        in_approach = False
+        for j in range(last_ph_bar_idx + 1, n):
+            lvl = upper_lvl_history[j]
+            if lvl is None or lvl <= 0:
+                continue
+            approach_thresh = lvl * (1 - TOUCH_TOLERANCE_PCT / 100)
+            gap_thresh      = lvl * (1 - TOUCH_GAP_PCT       / 100)
+
+            approached = highs[j]  >= approach_thresh
+            close_low  = closes[j] <  lvl
+
+            if approached and close_low:
+                if not in_approach:
+                    touches_above += 1
+                    in_approach = True
+                # else: same approach attempt continues — don't double-count
+            else:
+                # Reset only when price has clearly dropped away from the line
+                if highs[j] < gap_thresh:
+                    in_approach = False
+
     return {
-        "upper_lvl": upper_lvl,
-        "lower_lvl": lower_lvl,
-        "last_ph":   cur_last_ph,
-        "last_pl":   cur_last_pl,
+        "upper_lvl":     upper_lvl,
+        "lower_lvl":     lower_lvl,
+        "last_ph":       cur_last_ph,
+        "last_pl":       cur_last_pl,
+        "touches_above": touches_above,
     }
 
 
@@ -612,6 +671,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
                 f"📈 upperLvl   : <code>{signal_info.get('upper_lvl')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
+                f"🪢 Touches    : <code>{signal_info.get('touches_above')}</code> (≥ {MIN_TL_TOUCHES})\n"
                 f"🧱 armed @TL  : <code>{signal_info.get('armed_upper_lvl')}</code>\n"
                 f"⏳ bars armed : <code>{signal_info.get('bars_armed')}</code> / {RETEST_MAX_BARS}\n"
                 f"<b>✅ Retest conditions:</b>\n"
@@ -636,6 +696,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
                 f"📈 upperLvl   : <code>{signal_info.get('upper_lvl')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
+                f"🪢 Touches    : <code>{signal_info.get('touches_above')}</code> (≥ {MIN_TL_TOUCHES})\n"
                 f"<b>✅ Filters passed:</b>\n"
                 f"• fresh cross : <code>True</code> "
                 f"(prev≤{signal_info.get('upper_lvl')} &amp; c15&gt;{signal_info.get('upper_lvl')})\n"
@@ -688,11 +749,13 @@ def check_and_trade(symbol, row, df, all_state):
     highs_1h  = [float(c["high"])  for c in candles_1h]
     lows_1h   = [float(c["low"])   for c in candles_1h]
     closes_1h = [float(c["close"]) for c in candles_1h]
+    opens_1h  = [float(c["open"])  for c in candles_1h]
 
-    tl = compute_trendlines(highs_1h, lows_1h, closes_1h, SWING_LOOKBACK, SLOPE_MULT)
-    upper_lvl = tl["upper_lvl"]
-    last_pl   = tl["last_pl"]
-    last_ph   = tl["last_ph"]
+    tl = compute_trendlines(opens_1h, highs_1h, lows_1h, closes_1h, SWING_LOOKBACK, SLOPE_MULT)
+    upper_lvl     = tl["upper_lvl"]
+    last_pl       = tl["last_pl"]
+    last_ph       = tl["last_ph"]
+    touches_above = tl["touches_above"]
 
     if upper_lvl is None or last_pl is None or last_ph is None:
         print(f"[SKIP] {symbol} — trendline / pivots not ready yet")
@@ -868,13 +931,16 @@ def check_and_trade(symbol, row, df, all_state):
     else:
         cooldown_ok = True
 
-    long_sig = fresh_cross and body_break and strong_bar and vol_ok and atr_ok and cooldown_ok
+    long_sig = (
+        fresh_cross and body_break and strong_bar and vol_ok and atr_ok
+        and cooldown_ok and (touches_above >= MIN_TL_TOUCHES)
+    )
 
     # ─── Scan log ───────────────────────────────────────────
     print(
         f"[SCAN] {symbol} | c15={c15} prev_c15={prev_c15} | "
         f"upperLvl={round(upper_lvl, precision)} lastPL={round(last_pl, precision)} "
-        f"lastPH={round(last_ph, precision)} | "
+        f"lastPH={round(last_ph, precision)} touches={touches_above}/{MIN_TL_TOUCHES} | "
         f"fresh={fresh_cross} body={body_break} "
         f"strong={strong_bar}({round(body_pct, 1)}%) "
         f"vol={vol_ok}({round(v15, 2)} vs {round(vol_sma * VOL_MULT, 2)}) "
@@ -891,12 +957,15 @@ def check_and_trade(symbol, row, df, all_state):
         # ARM: a fresh cross fired but main long_sig didn't go through
         # (because some anti-fakeout filter failed). We snapshot current
         # upper_lvl and watch for a pullback-bounce off this same line.
-        if fresh_cross and not long_sig:
+        # Only arm if the trendline has been touched at least MIN_TL_TOUCHES
+        # times — same quality bar as the main path.
+        if fresh_cross and not long_sig and touches_above >= MIN_TL_TOUCHES:
             st["retest_armed"]      = True
             st["retest_armed_ts"]   = ts15
             st["retest_upper_lvl"]  = upper_lvl
             st["retest_last_ph"]    = last_ph
             print(f"[RETEST-ARM] {symbol} — armed at upperLvl={round(upper_lvl, precision)} "
+                  f"touches={touches_above} "
                   f"(filters that blocked main: body={body_break} strong={strong_bar} "
                   f"vol={vol_ok} atr={atr_ok} cd={cooldown_ok})")
             send_telegram(
@@ -906,8 +975,12 @@ def check_and_trade(symbol, row, df, all_state):
                 f"📈 upperLvl   : <code>{round(upper_lvl, precision)}</code>\n"
                 f"🟢 lastPL     : <code>{round(last_pl, precision)}</code>\n"
                 f"🔴 lastPH     : <code>{round(last_ph, precision)}</code>\n"
+                f"🪢 Touches    : <code>{touches_above}</code> (≥ {MIN_TL_TOUCHES})\n"
                 f"⏳ Waiting up to {RETEST_MAX_BARS} × 15m bars for pullback-bounce"
             )
+        elif fresh_cross and not long_sig and touches_above < MIN_TL_TOUCHES:
+            print(f"[RETEST-NO-ARM] {symbol} — fresh cross but only {touches_above}/{MIN_TL_TOUCHES} touches, "
+                  f"trendline not tested enough")
 
         # EVALUATE: if armed, look for entry conditions on this 15m bar
         if st.get("retest_armed"):
@@ -967,13 +1040,16 @@ def check_and_trade(symbol, row, df, all_state):
                     cond_bullish   = c15 > o15
                     cond_body_ok   = body_pct >= RETEST_MIN_BODY_PCT
                     cond_cd_ok     = cooldown_ok
+                    cond_touches   = touches_above >= MIN_TL_TOUCHES
 
                     retest_sig = (cond_touch and cond_close_up and cond_bullish
-                                  and cond_body_ok and cond_cd_ok and not long_sig)
+                                  and cond_body_ok and cond_cd_ok and cond_touches
+                                  and not long_sig)
 
                     print(
                         f"[RETEST-EVAL] {symbol} | armed_lvl={round(armed_lvl, precision)} "
-                        f"upperLvl={round(upper_lvl, precision)} bars={bars_armed}/{RETEST_MAX_BARS} | "
+                        f"upperLvl={round(upper_lvl, precision)} bars={bars_armed}/{RETEST_MAX_BARS} "
+                        f"touches={touches_above}/{MIN_TL_TOUCHES} | "
                         f"touch={cond_touch}(l15={l15}) closeUp={cond_close_up} "
                         f"bull={cond_bullish} body={cond_body_ok}({round(body_pct, 1)}%) "
                         f"cd={cond_cd_ok} → retest={retest_sig}"
@@ -989,6 +1065,7 @@ def check_and_trade(symbol, row, df, all_state):
                             "last_ph":         round(last_ph, precision),
                             "body_pct":        round(body_pct, 1),
                             "bars_armed":      int(bars_armed),
+                            "touches_above":   touches_above,
                             "bars_since_last": (
                                 (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
                                 if last_entry_ts > 0 else "n/a"
@@ -1023,6 +1100,7 @@ def check_and_trade(symbol, row, df, all_state):
             "atr_threshold":   round(upper_lvl + atr_15 * ATR_MULT, precision),
             "bars_since_last": bars_since_last,
             "cooldown_bars":   COOLDOWN_BARS,
+            "touches_above":   touches_above,
         }
     elif retest_sig:
         entry_path = "tl_retest"
@@ -1092,6 +1170,7 @@ send_telegram(
     f"🛤 Paths      : <code>tl_break + tl_retest "
     f"(retest: {'ON' if USE_RETEST_PATH else 'OFF'}, "
     f"max {RETEST_MAX_BARS} bars, ±{RETEST_TOUCH_PCT}% touch, body≥{RETEST_MIN_BODY_PCT}%)</code>\n"
+    f"🪢 Touches    : <code>require ≥ {MIN_TL_TOUCHES} prior failed-break attempts on the trendline</code>\n"
     f"🎯 TP         : <code>entry × (1 + {TP_PCT}%)</code>\n"
     f"🛑 SL         : <code>upperLvl × (1 - {SL_BELOW_TL_PCT}%)</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
