@@ -20,17 +20,19 @@ BASE_URL = "https://api.coindcx.com"
 #
 # TIMEFRAME ARCHITECTURE:
 #   - Trendline / S-R levels   : 1h closed candles
-#   - Entry confirmation       : 15m closed candles
-#   - Scan interval            : 15 minutes
+#   - Entry confirmation       : 1h closed candles  (breakout & retest)
+#   - Scan interval            : 15 minutes  (just to catch a fresh 1h close
+#                                 quickly; strategy logic only runs once per
+#                                 new closed 1h bar via last_processed_1h_ts)
 #
 # ENTRY PATHS:
-#   - tl_break   : original — fresh cross above upper_lvl + all anti-fakeout
-#                  filters pass on the SAME 15m candle.
-#   - tl_retest  : new — when a fresh cross fires but filters fail, the bot
-#                  ARMS a retest watch. If price pulls back to upper_lvl and
-#                  bounces (15m wick touches the line, then closes back above
-#                  with a bullish body), it enters long. Captures the case
-#                  where the broken trendline acts as new support.
+#   - tl_break   : fresh cross above upper_lvl on a 1h close + all
+#                  anti-fakeout filters pass on the SAME 1h candle.
+#   - tl_retest  : when a fresh cross fires but filters fail, the bot ARMS
+#                  a retest watch. If a later 1h candle's wick touches
+#                  upper_lvl and the same candle closes back above with a
+#                  bullish body, it enters long. Captures the case where
+#                  the broken trendline acts as new support.
 # =============================================================================
 
 # ─── TRENDLINE TOUCH CONFIRMATION ───────────────────────────────────────────
@@ -53,7 +55,7 @@ ATR_PERIOD_TL    = 14          # ATR period for trendline slope (1h)
 TP_PCT           = 3.0         # fixed take-profit: entry × (1 + TP_PCT/100)
 SL_BELOW_TL_PCT  = 1.5         # SL placed X% below the upper trendline (broken resistance turned support)
 
-# ─── ANTI-FAKEOUT FILTERS (applied on 15m entry candle, tl_break path) ──────
+# ─── ANTI-FAKEOUT FILTERS (applied on 1h entry candle, tl_break path) ───────
 USE_BODY_BREAK   = True
 USE_STRONG_BAR   = True
 MIN_BODY_PCT     = 50.0        # body ≥ X% of range
@@ -62,26 +64,22 @@ VOL_MULT         = 1.2         # vol > SMA(20) × mult
 VOL_SMA_PERIOD   = 20
 USE_ATR_DIST     = True
 ATR_MULT         = 0.25        # break ≥ X × ATR(14) beyond TL
-ATR_PERIOD_15M   = 14
 USE_COOLDOWN     = True
-COOLDOWN_BARS    = 5           # 15m bars between entries
+COOLDOWN_BARS    = 5           # 1h bars between entries (= 5 hours)
 
 # ─── RETEST PATH (tl_retest) ─────────────────────────────────────────────────
 USE_RETEST_PATH      = True    # master switch for the retest path
-RETEST_MAX_BARS      = 20      # max 15m bars to wait for retest (= 5 hours)
-RETEST_TOUCH_PCT     = 0.3     # wick must come within ±X% of upper_lvl
+RETEST_MAX_BARS      = 5       # max 1h bars to wait for retest (= 5 hours)
+RETEST_TOUCH_PCT     = 0.3     # 1h wick must come within ±X% of upper_lvl
 RETEST_MIN_BODY_PCT  = 30      # bounce-candle body ≥ X% of range
-RETEST_CANCEL_PCT    = 1.0     # cancel retest if 15m close falls X% below TL
+RETEST_CANCEL_PCT    = 1.0     # cancel retest if 1h close falls X% below TL
 
 # ─── CANDLE COUNTS ───────────────────────────────────────────────────────────
 TL_CANDLES_1H    = 500         # 1h candles fetched for trendline calc
-ENTRY_CANDLES    = 60          # 15m candles for entry confirmation
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY    = "60"            # 1h
-RESOLUTION_ENTRY      = "15"            # 15m
 CANDLE_SECONDS        = 60 * 60         # 1h in seconds
-ENTRY_CANDLE_SECONDS  = 15 * 60         # 15m in seconds
 SCAN_INTERVAL         = 15 * 60         # 15 min
 
 # ─── REQUEST TIMEOUTS ────────────────────────────────────────────────────────
@@ -187,16 +185,17 @@ def save_state(state):
 
 def init_symbol_state():
     return {
-        "in_position":        False,
-        "entry_path":         None,
-        "entry_price":        None,
-        "tp_level":           None,
-        "sl_price":           None,
-        "last_entry_ts":      0,        # ms timestamp of last entry (cooldown anchor)
+        "in_position":          False,
+        "entry_path":           None,
+        "entry_price":          None,
+        "tp_level":             None,
+        "sl_price":             None,
+        "last_entry_ts":        0,        # ms timestamp of last entry (cooldown anchor)
+        "last_processed_1h_ts": 0,        # ms ts of last 1h bar strategy ran on (dedup)
 
         # ── Retest path state ──────────────────────────────
         "retest_armed":       False,
-        "retest_armed_ts":    0,        # ms ts of the 15m bar that armed
+        "retest_armed_ts":    0,        # ms ts of the 1h bar that armed
         "retest_upper_lvl":   None,     # upper_lvl snapshot at arming
         "retest_last_ph":     None,     # for telegram/log only
     }
@@ -666,8 +665,8 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
             sig_block = (
                 f"\n━━━━━━━━━━━━━━━━━━\n"
                 f"<b>📊 Retest signal:</b>\n"
-                f"📍 c15        : <code>{signal_info.get('c15')}</code>\n"
-                f"⏬ low15      : <code>{signal_info.get('l15')}</code>\n"
+                f"📍 c1h        : <code>{signal_info.get('c1h')}</code>\n"
+                f"⏬ low1h      : <code>{signal_info.get('l1h')}</code>\n"
                 f"📈 upperLvl   : <code>{signal_info.get('upper_lvl')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
@@ -676,30 +675,30 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
                 f"⏳ bars armed : <code>{signal_info.get('bars_armed')}</code> / {RETEST_MAX_BARS}\n"
                 f"<b>✅ Retest conditions:</b>\n"
                 f"• wick touched line : <code>True</code> "
-                f"(low {signal_info.get('l15')} within ±{RETEST_TOUCH_PCT}% of upperLvl)\n"
+                f"(low {signal_info.get('l1h')} within ±{RETEST_TOUCH_PCT}% of upperLvl)\n"
                 f"• close above line  : <code>True</code> "
-                f"(c15 {signal_info.get('c15')} &gt; upperLvl)\n"
+                f"(c1h {signal_info.get('c1h')} &gt; upperLvl)\n"
                 f"• bullish bar       : <code>True</code> "
-                f"(c15 &gt; o15)\n"
+                f"(c1h &gt; o1h)\n"
                 f"• body strong       : <code>True</code> "
                 f"(body={signal_info.get('body_pct')}% ≥ {RETEST_MIN_BODY_PCT}%)\n"
                 f"• cooldown          : <code>True</code> "
                 f"({signal_info.get('bars_since_last')} bars, need ≥{COOLDOWN_BARS})"
             )
         else:
-            # tl_break (original)
+            # tl_break
             sig_block = (
                 f"\n━━━━━━━━━━━━━━━━━━\n"
                 f"<b>📊 Signal that fired:</b>\n"
-                f"📍 c15        : <code>{signal_info.get('c15')}</code>\n"
-                f"⏪ prev_c15   : <code>{signal_info.get('prev_c15')}</code>\n"
+                f"📍 c1h        : <code>{signal_info.get('c1h')}</code>\n"
+                f"⏪ prev_c1h   : <code>{signal_info.get('prev_c1h')}</code>\n"
                 f"📈 upperLvl   : <code>{signal_info.get('upper_lvl')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
                 f"🪢 Touches    : <code>{signal_info.get('touches_above')}</code> (≥ {MIN_TL_TOUCHES})\n"
                 f"<b>✅ Filters passed:</b>\n"
                 f"• fresh cross : <code>True</code> "
-                f"(prev≤{signal_info.get('upper_lvl')} &amp; c15&gt;{signal_info.get('upper_lvl')})\n"
+                f"(prev≤{signal_info.get('upper_lvl')} &amp; c1h&gt;{signal_info.get('upper_lvl')})\n"
                 f"• body break  : <code>True</code> "
                 f"(min(o,c)={signal_info.get('min_oc')} &gt; upperLvl)\n"
                 f"• strong bar  : <code>True</code> "
@@ -707,7 +706,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
                 f"• volume      : <code>True</code> "
                 f"(vol={signal_info.get('vol')} &gt; SMA20×{signal_info.get('vol_mult')}={signal_info.get('vol_threshold')})\n"
                 f"• ATR distance: <code>True</code> "
-                f"(c15 &gt; upperLvl + {signal_info.get('atr_mult')}×ATR = {signal_info.get('atr_threshold')})\n"
+                f"(c1h &gt; upperLvl + {signal_info.get('atr_mult')}×ATR = {signal_info.get('atr_threshold')})\n"
                 f"• cooldown    : <code>True</code> "
                 f"({signal_info.get('bars_since_last')} bars since last entry, need ≥{signal_info.get('cooldown_bars')})"
             )
@@ -726,11 +725,11 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, entry_p
 
 
 # =====================================================
-# MAIN PER-SYMBOL LOGIC  (Trendline Break — long only)
+# MAIN PER-SYMBOL LOGIC  (Trendline Break — long only, 1h confirmation)
 # =====================================================
 
 def check_and_trade(symbol, row, df, all_state):
-    # ─── Fetch 1h for trendline / S-R ────────────────────────
+    # ─── Fetch 1h for trendline / S-R + signal evaluation ────
     candles_1h = fetch_candles(symbol, TL_CANDLES_1H, RESOLUTION_PRIMARY, CANDLE_SECONDS)
     min_1h_needed = SWING_LOOKBACK * 2 + ATR_PERIOD_TL + 5
 
@@ -770,13 +769,13 @@ def check_and_trade(symbol, row, df, all_state):
         st = init_symbol_state()
         all_state[symbol] = st
 
-    # Backfill any missing retest fields for older state files
+    # Backfill any missing fields for older state files
     for k, v in init_symbol_state().items():
         if k not in st:
             st[k] = v
 
     # =========================================================================
-    # TP COMPLETED MONITORING
+    # TP COMPLETED MONITORING  (runs every 15-min scan for fast wick detection)
     # =========================================================================
     tp_raw = df.iloc[row, 1] if df.shape[1] > 1 else ""
 
@@ -825,7 +824,7 @@ def check_and_trade(symbol, row, df, all_state):
             return
 
     # =========================================================================
-    # RECONCILE WITH EXCHANGE
+    # RECONCILE WITH EXCHANGE  (every scan)
     # =========================================================================
     position = get_position_by_pair(symbol)
 
@@ -837,9 +836,6 @@ def check_and_trade(symbol, row, df, all_state):
             st["entry_price"] = entry_px
             print(f"[RECONCILE] {symbol} — reconstructed state from exchange position")
 
-        # ── Sheet recovery: if state has no TP/SL, pull from exchange position.
-        #    Then write to sheet B/C if those cells are blank. Never overwrites
-        #    "TP COMPLETED" because that case already returned earlier.
         tp_pos, sl_pos = extract_tp_sl(position)
         if st.get("tp_level") is None and tp_pos is not None:
             st["tp_level"] = round(tp_pos, precision)
@@ -877,56 +873,51 @@ def check_and_trade(symbol, row, df, all_state):
         return
 
     # =========================================================================
-    # FETCH 15m FOR ENTRY CONFIRMATION
+    # 1h BAR — extract latest closed-bar values for signal evaluation
     # =========================================================================
-    candles_15m = fetch_candles(symbol, ENTRY_CANDLES, RESOLUTION_ENTRY, ENTRY_CANDLE_SECONDS)
-    min_15m_needed = max(VOL_SMA_PERIOD, ATR_PERIOD_15M) + 5
+    last1h = candles_1h[-1]
+    prev1h = candles_1h[-2]
 
-    if len(candles_15m) < min_15m_needed:
-        print(f"[SKIP] {symbol} — insufficient 15m candles ({len(candles_15m)})")
+    o1h = float(last1h["open"])
+    h1h = float(last1h["high"])
+    l1h = float(last1h["low"])
+    c1h = float(last1h["close"])
+    v1h = float(last1h.get("volume", 0))
+    ts1h = int(last1h["time"])
+    prev_c1h = float(prev1h["close"])
+
+    # =========================================================================
+    # DEDUP — strategy logic runs at most once per closed 1h bar.
+    # Subsequent 15-min scans on the same 1h bar will TP-monitor / reconcile
+    # but skip strategy evaluation (no duplicate ARM telegrams etc.)
+    # =========================================================================
+    if st.get("last_processed_1h_ts", 0) == ts1h:
+        save_state(all_state)
         return
 
-    if len(candles_15m) >= 1 and (now_ms - int(candles_15m[-1]["time"])) < ENTRY_CANDLE_SECONDS * 1000:
-        candles_15m = candles_15m[:-1]
-    if len(candles_15m) < min_15m_needed:
-        return
-
-    last15 = candles_15m[-1]
-    prev15 = candles_15m[-2]
-
-    o15 = float(last15["open"])
-    h15 = float(last15["high"])
-    l15 = float(last15["low"])
-    c15 = float(last15["close"])
-    v15 = float(last15.get("volume", 0))
-    ts15 = int(last15["time"])
-    prev_c15 = float(prev15["close"])
-
-    # ─── 15m filter calcs ────────────────────────────────────
-    bar_range = h15 - l15
-    bar_body  = abs(c15 - o15)
+    # =========================================================================
+    # 1h FILTER CALCS (tl_break path)
+    # =========================================================================
+    bar_range = h1h - l1h
+    bar_body  = abs(c1h - o1h)
     body_pct  = (bar_body / bar_range * 100) if bar_range > 0 else 0
 
-    vols = [float(c.get("volume", 0)) for c in candles_15m[-VOL_SMA_PERIOD:]]
-    vol_sma = sum(vols) / len(vols) if vols else 0
+    vols_1h = [float(c.get("volume", 0)) for c in candles_1h[-VOL_SMA_PERIOD:]]
+    vol_sma = sum(vols_1h) / len(vols_1h) if vols_1h else 0
 
-    highs_15m  = [float(c["high"])  for c in candles_15m]
-    lows_15m   = [float(c["low"])   for c in candles_15m]
-    closes_15m = [float(c["close"]) for c in candles_15m]
-    atr_arr_15 = compute_atr(highs_15m, lows_15m, closes_15m, ATR_PERIOD_15M)
-    atr_15 = atr_arr_15[-1] if atr_arr_15[-1] is not None else 0
+    atr_arr_1h = compute_atr(highs_1h, lows_1h, closes_1h, ATR_PERIOD_TL)
+    atr_1h = atr_arr_1h[-1] if atr_arr_1h[-1] is not None else 0
 
-    # ─── Filter conditions (tl_break path) ──────────────────
-    fresh_cross = (c15 > upper_lvl) and (prev_c15 <= upper_lvl)   # mirrors greenB (first cross)
-    body_break  = (not USE_BODY_BREAK) or (min(o15, c15) > upper_lvl)
+    fresh_cross = (c1h > upper_lvl) and (prev_c1h <= upper_lvl)
+    body_break  = (not USE_BODY_BREAK) or (min(o1h, c1h) > upper_lvl)
     strong_bar  = (not USE_STRONG_BAR) or (body_pct >= MIN_BODY_PCT)
-    vol_ok      = (not USE_VOLUME)     or (v15 > vol_sma * VOL_MULT)
-    atr_ok      = (not USE_ATR_DIST)   or (c15 > upper_lvl + atr_15 * ATR_MULT)
+    vol_ok      = (not USE_VOLUME)     or (v1h > vol_sma * VOL_MULT)
+    atr_ok      = (not USE_ATR_DIST)   or (c1h > upper_lvl + atr_1h * ATR_MULT)
 
-    # Cooldown
+    # Cooldown — in 1h bars
     last_entry_ts = st.get("last_entry_ts", 0) or 0
     if USE_COOLDOWN and last_entry_ts > 0:
-        bars_since  = (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+        bars_since  = (ts1h - last_entry_ts) // (CANDLE_SECONDS * 1000)
         cooldown_ok = bars_since >= COOLDOWN_BARS
     else:
         cooldown_ok = True
@@ -936,32 +927,27 @@ def check_and_trade(symbol, row, df, all_state):
         and cooldown_ok and (touches_above >= MIN_TL_TOUCHES)
     )
 
-    # ─── Scan log ───────────────────────────────────────────
     print(
-        f"[SCAN] {symbol} | c15={c15} prev_c15={prev_c15} | "
+        f"[SCAN] {symbol} | c1h={c1h} prev_c1h={prev_c1h} | "
         f"upperLvl={round(upper_lvl, precision)} lastPL={round(last_pl, precision)} "
         f"lastPH={round(last_ph, precision)} touches={touches_above}/{MIN_TL_TOUCHES} | "
         f"fresh={fresh_cross} body={body_break} "
         f"strong={strong_bar}({round(body_pct, 1)}%) "
-        f"vol={vol_ok}({round(v15, 2)} vs {round(vol_sma * VOL_MULT, 2)}) "
+        f"vol={vol_ok}({round(v1h, 2)} vs {round(vol_sma * VOL_MULT, 2)}) "
         f"atr={atr_ok} cd={cooldown_ok}"
     )
 
     # =========================================================================
-    # RETEST PATH — arm / evaluate / cancel
+    # RETEST PATH — arm / evaluate / cancel  (all on 1h bars)
     # =========================================================================
     retest_sig         = False
     retest_signal_info = None
 
     if USE_RETEST_PATH:
         # ARM: a fresh cross fired but main long_sig didn't go through
-        # (because some anti-fakeout filter failed). We snapshot current
-        # upper_lvl and watch for a pullback-bounce off this same line.
-        # Only arm if the trendline has been touched at least MIN_TL_TOUCHES
-        # times — same quality bar as the main path.
         if fresh_cross and not long_sig and touches_above >= MIN_TL_TOUCHES:
             st["retest_armed"]      = True
-            st["retest_armed_ts"]   = ts15
+            st["retest_armed_ts"]   = ts1h
             st["retest_upper_lvl"]  = upper_lvl
             st["retest_last_ph"]    = last_ph
             print(f"[RETEST-ARM] {symbol} — armed at upperLvl={round(upper_lvl, precision)} "
@@ -971,46 +957,45 @@ def check_and_trade(symbol, row, df, all_state):
             send_telegram(
                 f"🟠 <b>RETEST ARMED — {symbol}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
-                f"📍 c15        : <code>{round(c15, precision)}</code>\n"
+                f"📍 c1h        : <code>{round(c1h, precision)}</code>\n"
                 f"📈 upperLvl   : <code>{round(upper_lvl, precision)}</code>\n"
                 f"🟢 lastPL     : <code>{round(last_pl, precision)}</code>\n"
                 f"🔴 lastPH     : <code>{round(last_ph, precision)}</code>\n"
                 f"🪢 Touches    : <code>{touches_above}</code> (≥ {MIN_TL_TOUCHES})\n"
-                f"⏳ Waiting up to {RETEST_MAX_BARS} × 15m bars for pullback-bounce"
+                f"⏳ Waiting up to {RETEST_MAX_BARS} × 1h bars for pullback-bounce"
             )
         elif fresh_cross and not long_sig and touches_above < MIN_TL_TOUCHES:
             print(f"[RETEST-NO-ARM] {symbol} — fresh cross but only {touches_above}/{MIN_TL_TOUCHES} touches, "
                   f"trendline not tested enough")
 
-        # EVALUATE: if armed, look for entry conditions on this 15m bar
+        # EVALUATE
         if st.get("retest_armed"):
             armed_ts  = st.get("retest_armed_ts", 0)
             armed_lvl = st.get("retest_upper_lvl")
 
             if armed_ts and armed_lvl:
-                bars_armed = max(0, (ts15 - armed_ts) // (ENTRY_CANDLE_SECONDS * 1000))
+                bars_armed = max(0, (ts1h - armed_ts) // (CANDLE_SECONDS * 1000))
 
                 # Cancel: timed out
                 if bars_armed > RETEST_MAX_BARS:
-                    print(f"[RETEST-CANCEL] {symbol} — timed out after {bars_armed} bars")
+                    print(f"[RETEST-CANCEL] {symbol} — timed out after {bars_armed} 1h bars")
                     send_telegram(
                         f"⌛ <b>RETEST EXPIRED — {symbol}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"⏳ {bars_armed} &gt; {RETEST_MAX_BARS} × 15m bars, no bounce occurred"
+                        f"⏳ {bars_armed} &gt; {RETEST_MAX_BARS} × 1h bars, no bounce occurred"
                     )
                     st["retest_armed"]     = False
                     st["retest_armed_ts"]  = 0
                     st["retest_upper_lvl"] = None
                     st["retest_last_ph"]   = None
 
-                # Cancel: close fell well below the trendline
-                elif c15 < upper_lvl * (1 - RETEST_CANCEL_PCT / 100):
-                    print(f"[RETEST-CANCEL] {symbol} — close {c15} fell &gt;{RETEST_CANCEL_PCT}% "
+                elif c1h < upper_lvl * (1 - RETEST_CANCEL_PCT / 100):
+                    print(f"[RETEST-CANCEL] {symbol} — close {c1h} fell &gt;{RETEST_CANCEL_PCT}% "
                           f"below upperLvl {round(upper_lvl, precision)} → trendline broken")
                     send_telegram(
                         f"❌ <b>RETEST CANCELLED — {symbol}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📍 c15      : <code>{round(c15, precision)}</code>\n"
+                        f"📍 c1h      : <code>{round(c1h, precision)}</code>\n"
                         f"📈 upperLvl : <code>{round(upper_lvl, precision)}</code>\n"
                         f"⚠️ Reason   : trendline broken (close fell &gt;{RETEST_CANCEL_PCT}% below)"
                     )
@@ -1020,24 +1005,25 @@ def check_and_trade(symbol, row, df, all_state):
                     st["retest_last_ph"]   = None
 
                 elif bars_armed < 1:
-                    # Just armed on THIS scan — don't allow same-bar trigger.
-                    # Wait for next 15m bar before evaluating bounce conditions.
-                    print(f"[RETEST-WAIT] {symbol} — just armed this bar, "
-                          f"waiting for next 15m bar before checking bounce")
+                    # Just armed on THIS 1h bar — wait for the next one before
+                    # checking bounce conditions.
+                    print(f"[RETEST-WAIT] {symbol} — just armed this 1h bar, "
+                          f"waiting for next 1h bar before checking bounce")
 
                 else:
-                    # TRIGGER conditions:
-                    #   1. wick of this 15m candle came within ±RETEST_TOUCH_PCT of upperLvl
-                    #   2. close is back above upperLvl
-                    #   3. candle is bullish (c15 > o15)
-                    #   4. body is reasonably strong (≥ RETEST_MIN_BODY_PCT of range)
+                    # TRIGGER (1h candle that bounces off the line):
+                    #   1. wick within ±RETEST_TOUCH_PCT of upper_lvl
+                    #   2. close back above upper_lvl
+                    #   3. bullish candle (c1h > o1h)
+                    #   4. body ≥ RETEST_MIN_BODY_PCT of range
                     #   5. cooldown clear
+                    #   6. touches still ≥ MIN_TL_TOUCHES
                     touch_floor = upper_lvl * (1 - RETEST_TOUCH_PCT / 100)
                     touch_ceil  = upper_lvl * (1 + RETEST_TOUCH_PCT / 100)
 
-                    cond_touch     = touch_floor <= l15 <= touch_ceil
-                    cond_close_up  = c15 > upper_lvl
-                    cond_bullish   = c15 > o15
+                    cond_touch     = touch_floor <= l1h <= touch_ceil
+                    cond_close_up  = c1h > upper_lvl
+                    cond_bullish   = c1h > o1h
                     cond_body_ok   = body_pct >= RETEST_MIN_BODY_PCT
                     cond_cd_ok     = cooldown_ok
                     cond_touches   = touches_above >= MIN_TL_TOUCHES
@@ -1050,15 +1036,15 @@ def check_and_trade(symbol, row, df, all_state):
                         f"[RETEST-EVAL] {symbol} | armed_lvl={round(armed_lvl, precision)} "
                         f"upperLvl={round(upper_lvl, precision)} bars={bars_armed}/{RETEST_MAX_BARS} "
                         f"touches={touches_above}/{MIN_TL_TOUCHES} | "
-                        f"touch={cond_touch}(l15={l15}) closeUp={cond_close_up} "
+                        f"touch={cond_touch}(l1h={l1h}) closeUp={cond_close_up} "
                         f"bull={cond_bullish} body={cond_body_ok}({round(body_pct, 1)}%) "
                         f"cd={cond_cd_ok} → retest={retest_sig}"
                     )
 
                     if retest_sig:
                         retest_signal_info = {
-                            "c15":             round(c15, precision),
-                            "l15":             round(l15, precision),
+                            "c1h":             round(c1h, precision),
+                            "l1h":             round(l1h, precision),
                             "upper_lvl":       round(upper_lvl, precision),
                             "armed_upper_lvl": round(armed_lvl, precision),
                             "last_pl":         round(last_pl, precision),
@@ -1067,7 +1053,7 @@ def check_and_trade(symbol, row, df, all_state):
                             "bars_armed":      int(bars_armed),
                             "touches_above":   touches_above,
                             "bars_since_last": (
-                                (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+                                (ts1h - last_entry_ts) // (CANDLE_SECONDS * 1000)
                                 if last_entry_ts > 0 else "n/a"
                             ),
                         }
@@ -1075,29 +1061,29 @@ def check_and_trade(symbol, row, df, all_state):
     # =========================================================================
     # ENTRY DISPATCH — main path takes priority
     # =========================================================================
-    entry_path  = None
-    sig_info    = None
+    entry_path = None
+    sig_info   = None
 
     if long_sig:
         entry_path = "tl_break"
         bars_since_last = (
-            (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+            (ts1h - last_entry_ts) // (CANDLE_SECONDS * 1000)
             if last_entry_ts > 0 else "n/a"
         )
         sig_info = {
-            "c15":             round(c15, precision),
-            "prev_c15":        round(prev_c15, precision),
+            "c1h":             round(c1h, precision),
+            "prev_c1h":        round(prev_c1h, precision),
             "upper_lvl":       round(upper_lvl, precision),
             "last_pl":         round(last_pl, precision),
             "last_ph":         round(last_ph, precision),
-            "min_oc":          round(min(o15, c15), precision),
+            "min_oc":          round(min(o1h, c1h), precision),
             "body_pct":        round(body_pct, 1),
             "min_body_pct":    MIN_BODY_PCT,
-            "vol":             round(v15, 2),
+            "vol":             round(v1h, 2),
             "vol_mult":        VOL_MULT,
             "vol_threshold":   round(vol_sma * VOL_MULT, 2),
             "atr_mult":        ATR_MULT,
-            "atr_threshold":   round(upper_lvl + atr_15 * ATR_MULT, precision),
+            "atr_threshold":   round(upper_lvl + atr_1h * ATR_MULT, precision),
             "bars_since_last": bars_since_last,
             "cooldown_bars":   COOLDOWN_BARS,
             "touches_above":   touches_above,
@@ -1106,14 +1092,16 @@ def check_and_trade(symbol, row, df, all_state):
         entry_path = "tl_retest"
         sig_info   = retest_signal_info
 
+    # Mark this 1h bar as processed BEFORE returning, so subsequent 15-min
+    # scans on the same 1h bar skip strategy eval (only TP/reconcile run).
+    st["last_processed_1h_ts"] = ts1h
+
     if entry_path is None:
         save_state(all_state)
         return
 
     # ─── Compute SL/TP (same geometry for both paths) ───────
-    # SL = SL_BELOW_TL_PCT% below the upper trendline (the broken resistance
-    #      that now acts as support). TP = fixed TP_PCT% above entry.
-    entry_price = c15
+    entry_price = c1h
     sl_price    = upper_lvl * (1 - SL_BELOW_TL_PCT / 100)
     tp_price    = entry_price * (1 + TP_PCT / 100)
     risk        = entry_price - sl_price
@@ -1138,8 +1126,8 @@ def check_and_trade(symbol, row, df, all_state):
         st["entry_price"]   = round(entry_price, precision)
         st["tp_level"]      = round(tp_price,    precision)
         st["sl_price"]      = round(sl_price,    precision)
-        st["last_entry_ts"] = ts15
-        # Clear retest arming on any successful entry (don't re-trigger same setup)
+        st["last_entry_ts"] = ts1h
+        # Clear retest arming on any successful entry
         st["retest_armed"]     = False
         st["retest_armed_ts"]  = 0
         st["retest_upper_lvl"] = None
@@ -1163,13 +1151,13 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy   : <code>Trendline Break + Anti-Fakeout (LONG only)</code>\n"
     f"⏱ TL / S-R   : <code>1h closed bars (lookback={SWING_LOOKBACK}, slope×{SLOPE_MULT})</code>\n"
-    f"⚡ Entry      : <code>15m close confirmation</code>\n"
-    f"🔁 Scan       : <code>Every 15 minutes</code>\n"
+    f"⚡ Entry      : <code>1h close confirmation (breakout & retest)</code>\n"
+    f"🔁 Scan       : <code>Every 15 minutes (strategy runs once per new 1h bar)</code>\n"
     f"🧪 Filters    : <code>body-break, body≥{MIN_BODY_PCT:.0f}%, vol&gt;SMA{VOL_SMA_PERIOD}×{VOL_MULT}, "
-    f"break≥{ATR_MULT}×ATR{ATR_PERIOD_15M}, cooldown={COOLDOWN_BARS}×15m</code>\n"
+    f"break≥{ATR_MULT}×ATR14, cooldown={COOLDOWN_BARS}×1h</code>\n"
     f"🛤 Paths      : <code>tl_break + tl_retest "
     f"(retest: {'ON' if USE_RETEST_PATH else 'OFF'}, "
-    f"max {RETEST_MAX_BARS} bars, ±{RETEST_TOUCH_PCT}% touch, body≥{RETEST_MIN_BODY_PCT}%)</code>\n"
+    f"max {RETEST_MAX_BARS}×1h, ±{RETEST_TOUCH_PCT}% touch, body≥{RETEST_MIN_BODY_PCT}%)</code>\n"
     f"🪢 Touches    : <code>require ≥ {MIN_TL_TOUCHES} prior failed-break attempts on the trendline</code>\n"
     f"🎯 TP         : <code>entry × (1 + {TP_PCT}%)</code>\n"
     f"🛑 SL         : <code>upperLvl × (1 - {SL_BELOW_TL_PCT}%)</code>\n"
