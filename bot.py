@@ -42,7 +42,7 @@ BASE_URL = "https://api.coindcx.com"
 # (i.e. price tried to break and failed). Consecutive bars in the same
 # approach are collapsed: price must drop ≥ TOUCH_GAP_PCT below the line
 # before the next attempt counts as a separate touch.
-MIN_TL_TOUCHES       = 2       # require ≥ N failed-break attempts on the line
+MIN_TL_TOUCHES       = 4       # require ≥ N failed-break attempts on the line
 TOUCH_TOLERANCE_PCT  = 0.5     # high within ±X% of line counts as approaching
 TOUCH_GAP_PCT        = 1.0     # must drop X% below line to "reset" for next touch
 
